@@ -8,30 +8,52 @@
 </section>
 
 <form class="panel search-form" action="{{ url_for('search') }}" method="post">
+  <fieldset class="mode-toggle">
+    <legend>Search mode</legend>
+    <label><input type="radio" name="mode" value="browse" {% if filters.get('mode', 'browse') == 'browse' %}checked{% endif %}> Browse by role</label>
+    <label><input type="radio" name="mode" value="person" {% if filters.get('mode') == 'person' %}checked{% endif %}> Find a specific person</label>
+  </fieldset>
+  <label id="person-input-field" {% if filters.get('mode', 'browse') != 'person' %}hidden{% endif %}>Name or LinkedIn ID / profile URL
+    <input name="person_input" value="{{ filters.get('person_input', '') }}" maxlength="100" placeholder="Name, profile URL, or LinkedIn ID" {% if filters.get('mode', 'browse') != 'person' %}disabled{% endif %}>
+  </label>
   <div class="form-grid">
-    <label>Role keyword
-      <select name="role" required>
+    <label id="role-field">Role keyword
+      <select name="role" id="role-input" required>
+        <option value="" {% if not filters.get('role', roles[0]) %}selected{% endif %}>Any role</option>
         {% for role in roles %}
           <option value="{{ role }}" {% if filters.get('role', roles[0]) == role %}selected{% endif %}>{{ role|title }}</option>
         {% endfor %}
       </select>
     </label>
     <label>City
-      <input name="city" value="{{ filters.get('city', 'Coimbatore') }}" maxlength="80" required>
+      <input name="city" id="city-input" value="{{ filters.get('city', 'Coimbatore') }}" maxlength="100">
     </label>
-    <label>College
-      <select name="college">
-        <option value="">Any college</option>
-        {% for college in colleges %}
-          <option value="{{ college }}" {% if filters.get('college') == college %}selected{% endif %}>{{ college }}</option>
+    <label>Organisation type
+      <select name="org_type" id="org-type">
+        <option value="" {% if not filters.get('org_type') %}selected{% endif %}>Any</option>
+        {% for org_type in org_types %}
+          <option value="{{ org_type }}" {% if filters.get('org_type') == org_type %}selected{% endif %}>{{ org_type|title }}</option>
         {% endfor %}
       </select>
     </label>
-    <label>Or enter a college
-      <input name="college_custom" value="{% if filters.get('college') and filters.get('college') not in colleges %}{{ filters.get('college') }}{% endif %}" placeholder="College name" maxlength="120">
+    <label id="org-name-field" {% if not filters.get('org_type') %}hidden{% endif %}>
+      <span id="org-name-label-text">{% if filters.get('org_type') == 'other' %}Organisation{% elif filters.get('org_type') %}{{ filters.get('org_type')|title }}{% else %}Organisation{% endif %} name</span>
+      <input id="org-name" name="org_name" value="{{ filters.get('org_name', '') }}" placeholder="Organisation name" maxlength="100" {% if not filters.get('org_type') %}disabled{% endif %} {% if filters.get('org_type') == 'college' %}list="college-options"{% endif %}>
+      <datalist id="college-options">{% for college in college_options %}<option value="{{ college }}">{% endfor %}</datalist>
     </label>
-    <label class="span-two">Exclude words <span class="label-hint">comma separated</span>
-      <input name="exclude_words" value="{{ filters.get('exclude_words', default_excludes) }}" maxlength="200">
+    <label>Status
+      <select name="filter_status" id="filter-status">
+        <option value="any" {% if filters.get('filter_status', 'any') == 'any' %}selected{% endif %}>Any</option>
+        <option value="current" {% if filters.get('filter_status') == 'current' %}selected{% endif %}>Currently there</option>
+        <option value="past" {% if filters.get('filter_status') == 'past' %}selected{% endif %}>Past (alumni or ex-employee)</option>
+      </select>
+    </label>
+    <label id="batch-year-field" {% if filters.get('org_type') not in ('college', 'school') or filters.get('filter_status') != 'current' %}hidden{% endif %}>
+      Batch / graduation year <span class="label-hint">optional, e.g. 2027</span>
+      <input name="batch_year" value="{{ filters.get('batch_year', '') }}" inputmode="numeric" pattern="[0-9]{4}" maxlength="4" placeholder="2027" {% if filters.get('org_type') not in ('college', 'school') or filters.get('filter_status') != 'current' %}disabled{% endif %}>
+    </label>
+    <label class="span-two" id="exclude-field">Exclude words <span class="label-hint">comma separated</span>
+      <input name="exclude_words" value="{{ filters.get('exclude_words', default_excludes) }}" maxlength="100">
     </label>
     <label>Results per page
       <select name="per_page">
@@ -40,8 +62,9 @@
       </select>
     </label>
   </div>
+  <input type="hidden" name="page" value="1">
   <button class="button button-primary" type="submit">Search public web results</button>
-  <p class="form-footnote">Searches public web results only. No LinkedIn credentials or browser automation.</p>
+  <p class="form-footnote">Search results can't confirm identity or dates; verify dates on the profile. Check the photo, name and organisation on the profile before shortlisting. No LinkedIn credentials, scraping, or browser automation.</p>
 </form>
 
 {% if results is not none %}
@@ -50,26 +73,46 @@
       <div>
         <p class="eyebrow">RESULTS</p>
         <h2>Search results</h2>
-        <p class="muted">Query: <code>{{ search_query }}</code>{% if total_results %} · About {{ total_results }} results{% endif %}</p>
+        <p class="muted">Query: <code>{{ search_query }}</code>{% if cached %} · Cached result{% endif %}</p>
       </div>
-      <span class="result-count">{{ results|length }} new profiles</span>
+      <span class="result-count">{{ results|length }} profiles</span>
     </div>
+    {% if filters.get('mode') == 'browse' and already_saved_count %}
+      <div class="saved-toggle">
+        <span>{{ already_saved_count }} already saved {% if show_saved %}shown{% else %}hidden{% endif %}</span>
+        <form method="post" action="{{ url_for('search') }}">
+          {% for key, value in filters.items() %}<input type="hidden" name="{{ key }}" value="{{ value }}">{% endfor %}
+          <input type="hidden" name="page" value="{{ page }}">
+          <input type="hidden" name="show_saved" value="{% if not show_saved %}1{% endif %}">
+          <button class="button button-secondary" type="submit">{% if show_saved %}Hide saved{% else %}Show them{% endif %}</button>
+        </form>
+      </div>
+    {% endif %}
     {% if results %}
       <form method="post" action="{{ url_for('shortlist') }}">
         <div class="table-wrap">
           <table class="results-table">
-            <thead><tr><th>Shortlist</th><th>Creator</th><th>College</th></tr></thead>
+            <thead><tr><th>Shortlist</th><th>Creator</th><th>Organisation</th></tr></thead>
             <tbody>
               {% for result in results %}
                 <tr>
-                  <td><input class="profile-check" type="checkbox" name="profile" value="{{ result|tojson|forceescape }}" aria-label="Shortlist {{ result.name }}"></td>
+                  <td><input class="profile-check" type="checkbox" name="profile" value="{{ result|tojson|forceescape }}" aria-label="Shortlist {{ result.name }}" {% if result.shortlist_disabled %}disabled{% endif %}></td>
                   <td>
                     <a class="profile-name" href="{{ result.url }}" target="_blank" rel="noopener noreferrer">{{ result.name }}</a>
                     {% if result.headline %}<div class="profile-headline">{{ result.headline }}</div>{% endif %}
                     {% if result.snippet %}<p class="profile-snippet">{{ result.snippet }}</p>{% endif %}
+                    {% if result.saved_person %}<span class="hint-badge">Already in tracker: {{ result.saved_person.batch_name }}, status {{ result.saved_person.status }}</span>{% endif %}
+                    <div class="result-badges">
+                      {% if result.org_name %}<span class="hint-badge {% if result.org_match %}hint-match{% else %}hint-mismatch{% endif %}">{% if result.org_match %}Org match{% else %}Org not in snippet{% endif %}</span>{% else %}<span class="hint-badge">No org filter</span>{% endif %}
+                      {% if result.status_hint == 'current' %}<span class="hint-badge hint-current">Current per snippet</span>
+                      {% elif result.status_hint == 'past' %}<span class="hint-badge hint-past">Past (ended {{ result.years.end }})</span>
+                      {% else %}<span class="hint-badge">Dates unclear: check profile</span>{% endif %}
+                    </div>
+                    {% if result.experience %}<p class="result-detail"><strong>Experience:</strong> {{ result.experience }}</p>{% endif %}
+                    {% if result.education %}<p class="result-detail"><strong>Education:</strong> {{ result.education }}</p>{% endif %}
                     <a class="external-link" href="{{ result.url }}" target="_blank" rel="noopener noreferrer">Open profile ↗</a>
                   </td>
-                  <td>{% if result.college %}<span class="tag">{{ result.college }}</span>{% else %}<span class="muted">—</span>{% endif %}</td>
+                  <td>{% if result.org_name %}<span class="tag">{{ result.org_name }}</span><div class="muted small">{{ result.org_type|title }}</div>{% else %}<span class="muted">—</span>{% endif %}</td>
                 </tr>
               {% endfor %}
             </tbody>
@@ -77,21 +120,28 @@
         </div>
         <div class="table-actions">
           <button class="button button-primary" type="submit">Add selected to shortlist</button>
-          <span class="muted">Shortlisted profiles are hidden from future searches.</span>
+          <span class="muted">Profiles must be reviewed manually; nothing is sent by the app.</span>
         </div>
       </form>
     {% else %}
-      <div class="empty-state">
-        <strong>No new profiles on this page.</strong>
-        <p>They may already be saved, or the search returned no matching profiles. Try another page or adjust your filters.</p>
-      </div>
+      <div class="empty-state"><strong>No new profiles on this page.</strong><p>No results to show after saved-profile filtering. Try another page or adjust your filters.</p></div>
     {% endif %}
+    <div class="search-result-actions">
+      <form method="post" action="{{ url_for('search') }}">
+        {% for key, value in filters.items() %}<input type="hidden" name="{{ key }}" value="{{ value }}">{% endfor %}
+        <input type="hidden" name="page" value="{{ page }}">
+        <input type="hidden" name="refresh" value="1">
+        {% if show_saved %}<input type="hidden" name="show_saved" value="1">{% endif %}
+        <button class="button button-secondary" type="submit">Refresh</button>
+      </form>
+    </div>
     {% if page > 1 or next_page %}
       <div class="pagination">
         {% if page > 1 %}
           <form method="post" action="{{ url_for('search') }}">
             {% for key, value in filters.items() %}<input type="hidden" name="{{ key }}" value="{{ value }}">{% endfor %}
             <input type="hidden" name="page" value="{{ page - 1 }}">
+            {% if show_saved %}<input type="hidden" name="show_saved" value="1">{% endif %}
             <button class="button button-secondary" type="submit">← Previous</button>
           </form>
         {% endif %}
@@ -100,6 +150,7 @@
           <form method="post" action="{{ url_for('search') }}">
             {% for key, value in filters.items() %}<input type="hidden" name="{{ key }}" value="{{ value }}">{% endfor %}
             <input type="hidden" name="page" value="{{ page + 1 }}">
+            {% if show_saved %}<input type="hidden" name="show_saved" value="1">{% endif %}
             <button class="button button-secondary" type="submit">Next →</button>
           </form>
         {% endif %}

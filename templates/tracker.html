@@ -7,7 +7,10 @@
     <h1>Tracker</h1>
     <p>Keep your outreach thoughtful and record each status yourself.</p>
   </div>
-  <a class="button button-secondary" href="{{ url_for('export_csv') }}">Export CSV</a>
+  <div class="export-actions">
+    <a class="button button-secondary" href="{{ url_for('export_csv', status=status_filter or None, verified_current='1' if verified_current else None, batch=batch_filter or None) }}">Export CSV</a>
+    <a class="button button-primary" href="{{ url_for('export_xlsx', status=status_filter or None, verified_current='1' if verified_current else None, batch=batch_filter or None) }}">Export Excel</a>
+  </div>
 </section>
 <div class="daily-count {% if sent_today > warning_threshold %}daily-count-warning{% endif %}">
   <span class="count-number">{{ sent_today }}</span>
@@ -20,6 +23,14 @@
     <option value="">All statuses</option>
     {% for status in statuses %}<option value="{{ status }}" {% if status_filter == status %}selected{% endif %}>{{ status|title }}</option>{% endfor %}
   </select>
+  <label class="checkbox-label"><input type="checkbox" name="verified_current" value="1" {% if verified_current %}checked{% endif %}> Verified current only</label>
+  <label for="batch-filter">Batch</label>
+  <select id="batch-filter" name="batch">
+    <option value="">All batches</option>
+    <option value="current" {% if batch_filter == 'current' %}selected{% endif %}>Current only</option>
+    {% for batch in batches %}<option value="{{ batch.id }}" {% if batch_filter|string == batch.id|string %}selected{% endif %}>{{ batch.name }}</option>{% endfor %}
+  </select>
+  <button class="button button-secondary" type="submit">Apply filters</button>
 </form>
 {% if people %}
   <div class="card-list">
@@ -32,10 +43,14 @@
           </div>
           <span class="status-pill status-{{ person.status }}">{{ person.status|title }}</span>
         </div>
-        {% if person.college %}<span class="tag">{{ person.college }}</span>{% endif %}
-        <p class="muted small">Added {{ person.created_at[:10] }}{% if person.sent_at %} · Sent {{ person.sent_at[:10] }}{% endif %}</p>
+        {% if person.org_name %}<span class="tag">{{ person.org_name }}</span><span class="muted small">{{ person.org_type|title }}</span>{% endif %}
+        <p class="muted small">Batch: {{ person.batch_name or 'Earlier outreach' }}{% if person.removed_from_shortlist %} · Removed from shortlist{% endif %}</p>
+        <p class="muted small">Manually verified: {{ person.verified_status|title }}{% if person.verified_note %} · {{ person.verified_note }}{% endif %}</p>
+        <p class="muted small">Added {{ person.created_at[:10] }}{% if person.sent_at %} · Sent {{ person.sent_at[:10] }}{% endif %}{% if person.last_status_changed_at %} · Last status change {{ person.last_status_changed_at }}{% endif %}</p>
         <form class="tracker-edit" method="post" action="{{ url_for('update_person', person_id=person.id) }}">
           <input type="hidden" name="return_status" value="{{ status_filter }}">
+          <input type="hidden" name="return_verified_current" value="{% if verified_current %}1{% endif %}">
+          <input type="hidden" name="return_batch" value="{{ batch_filter }}">
           <label>Status
             <select name="status">
               {% for status in statuses %}<option value="{{ status }}" {% if person.status == status %}selected{% endif %}>{{ status|title }}</option>{% endfor %}

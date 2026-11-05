@@ -1,7 +1,9 @@
 import csv
 import io
 import json
-from urllib.parse import quote, unquote, urlsplit
+import time
+from datetime import date, datetime
+from zoneinfo import ZoneInfo
 
 from flask import (
     Flask,
@@ -15,8 +17,11 @@ from flask import (
     url_for,
 )
 
+from affiliation import analyze_affiliation
 from config import Config
 from database import connect, init_db
+from export_excel import build_workbook
+from profile_urls import normalize_linkedin_url, parse_person_input
 from search_provider import (
     SearchAPIError,
     SearchConnectionError,
@@ -42,8 +47,14 @@ COLLEGES = (
     "Amrita Vishwa Vidyapeetham",
 )
 DEFAULT_EXCLUDES = "recruiter, hiring, HR, agency"
+ORG_TYPES = ("college", "school", "company", "other")
+FILTER_STATUSES = ("any", "current", "past")
+VERIFIED_STATUSES = ("unverified", "current", "past", "unsure")
 MAX_NOTE_LENGTH = 1000
 MAX_DRAFT_LENGTH = 5000
+MAX_SEARCH_TEXT_LENGTH = 100
+SEARCH_CACHE_SECONDS = 10 * 60
+IST = ZoneInfo("Asia/Kolkata")
 
 
 def create_app(test_config=None):
@@ -63,7 +74,9 @@ def create_app(test_config=None):
         return render_template(
             "search.html",
             roles=ROLES,
-            colleges=COLLEGES,
+            college_options=COLLEGES,
+            org_types=ORG_TYPES,
+            statuses=FILTER_STATUSES,
             default_excludes=DEFAULT_EXCLUDES,
             filters=request.args,
             results=None,
@@ -73,18 +86,26 @@ def create_app(test_config=None):
 
     @app.post("/search")
     def search():
-        filters = normalize_filters(request.form)
-        if filters["role"] not in ROLES or not filters["city"]:
-            flash("Choose a role and enter a city to search.", "error")
+        try:
+            filters = normalize_filters(request.form)
+            if filters["mode"] == "browse":
+                if filters["role"] not in ROLES or not filters["city"]:
+                    raise ValueError("Choose a role and enter a city to browse.")
+            elif not filters["person_input"]:
+                raise ValueError("Enter a name, LinkedIn profile URL, or LinkedIn ID.")
+        except ValueError as exc:
+            flash(str(exc), "error")
             return render_template(
                 "search.html",
                 roles=ROLES,
-                colleges=COLLEGES,
+                college_options=COLLEGES,
+                org_types=ORG_TYPES,
+                statuses=FILTER_STATUSES,
                 default_excludes=DEFAULT_EXCLUDES,
-                filters=filters,
+                filters=request.form,
                 results=None,
                 page=1,
-                per_page=filters["per_page"],
+                per_page=normalize_page_size(request.form.get("per_page")),
             ), 400
 
         page = parse_page(request.form.get("page"))
@@ -92,31 +113,58 @@ def create_app(test_config=None):
         results = []
         next_page = False
         api_error = None
+        cached = False
+        refresh = request.form.get("refresh") == "1"
+        provider_results = None
+        if not refresh:
+            provider_results = get_cached_results(db, query, page, filters["per_page"])
+            cached = provider_results is not None
+        if provider_results is None:
+            try:
+                provider_results = search_web(
+                    query, num=filters["per_page"], page=page
+                )
+                provider_results = provider_results[:filters["per_page"]]
+                save_cached_results(
+                    db, query, page, filters["per_page"], provider_results
+                )
+            except RuntimeError as exc:
+                api_error = str(exc)
+            except SearchAPIError as exc:
+                if exc.status_code in (401, 403):
+                    api_error = "Serper rejected the API key. Check SERPER_API_KEY in your .env file."
+                elif exc.status_code == 429:
+                    api_error = "Serper rate limit reached or search credits exhausted. Please try again later."
+                else:
+                    api_error = "Serper search could not complete this request. Please try again."
+            except SearchTimeoutError:
+                api_error = "Serper search timed out. Please try again."
+            except SearchConnectionError:
+                api_error = "Could not connect to Serper. Check your connection and try again."
+            except SearchResponseError:
+                api_error = "Serper returned an unreadable response. Please try again."
 
-        try:
-            provider_results = search_web(
-                query, num=filters["per_page"], page=page
-            )
-            results = shape_results(provider_results, filters["college"])
-            next_page = len(provider_results) == filters["per_page"] and page < 10
-        except RuntimeError as exc:
-            api_error = str(exc)
-        except SearchAPIError as exc:
-            if exc.status_code in (401, 403):
-                api_error = "Serper rejected the API key. Check SERPER_API_KEY in your .env file."
-            elif exc.status_code == 429:
-                api_error = "Serper rate limit reached or search credits exhausted. Please try again later."
+        if provider_results is not None:
+            results = shape_results(provider_results, filters)
+            saved_people = get_saved_people_by_url(db)
+            already_saved = 0
+            for result in results:
+                saved = saved_people.get(result["url"])
+                result["saved_person"] = saved
+                if saved:
+                    already_saved += 1
+            if filters["mode"] == "browse":
+                if request.form.get("show_saved") != "1":
+                    results = [result for result in results if not result["saved_person"]]
+                else:
+                    for result in results:
+                        result["shortlist_disabled"] = bool(result["saved_person"])
             else:
-                api_error = "Serper search could not complete this request. Please try again."
-        except SearchTimeoutError:
-            api_error = "Serper search timed out. Please try again."
-        except SearchConnectionError:
-            api_error = "Could not connect to Serper. Check your connection and try again."
-        except SearchResponseError:
-            api_error = "Serper returned an unreadable response. Please try again."
-
-        saved_urls = get_saved_urls(db)
-        results = [item for item in results if item["url"] not in saved_urls]
+                for result in results:
+                    result["shortlist_disabled"] = bool(result["saved_person"])
+            next_page = len(provider_results) == filters["per_page"] and page < 10
+        else:
+            already_saved = 0
 
         with db() as connection:
             connection.execute(
@@ -130,7 +178,9 @@ def create_app(test_config=None):
         return render_template(
             "search.html",
             roles=ROLES,
-            colleges=COLLEGES,
+            college_options=COLLEGES,
+            org_types=ORG_TYPES,
+            statuses=FILTER_STATUSES,
             default_excludes=DEFAULT_EXCLUDES,
             filters=filters,
             results=results,
@@ -138,6 +188,10 @@ def create_app(test_config=None):
             per_page=filters["per_page"],
             next_page=next_page,
             search_query=query,
+            cached=cached,
+            refresh=refresh,
+            already_saved_count=already_saved,
+            show_saved=request.form.get("show_saved") == "1",
         )
 
     @app.post("/shortlist")
@@ -152,52 +206,131 @@ def create_app(test_config=None):
             abort(400)
         saved = 0
         with db() as connection:
+            batch_id = ensure_current_batch(connection)
             for item in selected:
                 if not isinstance(item, dict):
                     abort(400)
                 url = normalize_linkedin_url(item.get("url", ""))
                 if url is None:
                     abort(400)
+                org_type = str(item.get("org_type") or "").lower()
+                if org_type not in ORG_TYPES:
+                    org_type = ""
+                existing = connection.execute(
+                    "SELECT id FROM people WHERE normalize_linkedin_url(url) = ?",
+                    (url,),
+                ).fetchone()
+                if existing:
+                    continue
+                timestamp = ist_now()
                 cursor = connection.execute(
                     """INSERT OR IGNORE INTO people
-                        (name, headline, snippet, url, college, source, status)
-                        VALUES (?, ?, ?, ?, ?, 'Serper.dev', 'shortlisted')""",
+                        (name, headline, snippet, url, college, source, status,
+                         org_type, org_name, status_hint, years_text, batch_id,
+                         shortlisted_at, status_changed_at)
+                        VALUES (?, ?, ?, ?, '', 'Serper.dev', 'shortlisted',
+                                ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         str(item.get("name") or "LinkedIn profile")[:200],
                         str(item.get("headline") or "")[:500],
                         str(item.get("snippet") or "")[:2000],
                         url[:500],
-                        str(item.get("college", ""))[:120],
+                        org_type,
+                        str(item.get("org_name") or "")[:120],
+                        item.get("status_hint")
+                        if item.get("status_hint") in ("current", "past", "unclear")
+                        else "unclear",
+                        str(item.get("years_text") or "")[:40],
+                        batch_id,
+                        timestamp,
+                        timestamp,
                     ),
                 )
                 saved += cursor.rowcount
+                if cursor.rowcount:
+                    connection.execute(
+                        """INSERT INTO status_history
+                           (person_id, old_status, new_status, changed_at)
+                           VALUES (?, NULL, 'shortlisted', ?)""",
+                        (cursor.lastrowid, timestamp),
+                    )
         flash(f"Shortlisted {saved} profile(s).", "success")
         return redirect(url_for("shortlist_page"))
 
     @app.get("/shortlist")
     def shortlist_page():
         with db() as connection:
+            batch = connection.execute(
+                "SELECT * FROM batches WHERE is_current = 1 ORDER BY id DESC LIMIT 1"
+            ).fetchone()
             people = connection.execute(
-                "SELECT * FROM people WHERE status = 'shortlisted' ORDER BY updated_at DESC"
+                """SELECT * FROM people WHERE batch_id = ?
+                   AND removed_from_shortlist = 0
+                   ORDER BY shortlisted_at DESC, id DESC""",
+                (batch["id"] if batch else -1,),
             ).fetchall()
-        return render_template("shortlist.html", people=people)
+        return render_template(
+            "shortlist.html", people=people, batch=batch, person_count=len(people)
+        )
+
+    @app.post("/batches/new")
+    def start_new_batch():
+        with db() as connection:
+            connection.execute("UPDATE batches SET is_current = 0 WHERE is_current = 1")
+            batch_id = create_batch(connection)
+        flash("Started a new shortlist batch.", "success")
+        return redirect(url_for("shortlist_page", batch=batch_id))
+
+    @app.post("/people/<int:person_id>/remove")
+    def remove_from_shortlist(person_id):
+        timestamp = ist_now()
+        with db() as connection:
+            current = connection.execute(
+                "SELECT id FROM batches WHERE is_current = 1 ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+            if current is None:
+                abort(404)
+            cursor = connection.execute(
+                """UPDATE people SET removed_from_shortlist = 1, updated_at = ?
+                   WHERE id = ? AND batch_id = ? AND removed_from_shortlist = 0""",
+                (timestamp, person_id, current["id"]),
+            )
+        if not cursor.rowcount:
+            abort(404)
+        flash("Removed from the current shortlist; the tracker history is kept.", "success")
+        return redirect(url_for("shortlist_page"))
 
     @app.post("/people/<int:person_id>/save")
     def save_person(person_id):
         note = request.form.get("personal_note", "").strip()
-        if len(note) > MAX_NOTE_LENGTH:
+        verified_note = request.form.get("verified_note", "").strip()
+        if len(note) > MAX_NOTE_LENGTH or len(verified_note) > MAX_NOTE_LENGTH:
             flash(f"Notes must be {MAX_NOTE_LENGTH} characters or fewer.", "error")
             return redirect(url_for("shortlist_page"))
         with db() as connection:
+            person = connection.execute(
+                "SELECT verified_status, verified_note FROM people WHERE id = ?",
+                (person_id,),
+            ).fetchone()
+            if person is None:
+                abort(404)
+            verified_status = request.form.get(
+                "verified_status", person["verified_status"]
+            )
+            if verified_status not in VERIFIED_STATUSES:
+                abort(400)
+            if "verified_note" not in request.form:
+                verified_note = person["verified_note"]
             cursor = connection.execute(
-                """UPDATE people SET personal_note = ?,
+                """UPDATE people SET personal_note = ?, verified_status = ?,
+                    verified_note = ?,
                     updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
                     WHERE id = ?""",
-                (note, person_id),
+                (note, verified_status, verified_note, person_id),
             )
         if not cursor.rowcount:
             abort(404)
-        flash("Personal note saved.", "success")
+        flash("Notes and verification saved.", "success")
         return redirect(url_for("shortlist_page"))
 
     @app.post("/people/<int:person_id>/draft")
@@ -215,6 +348,22 @@ def create_app(test_config=None):
             if not note:
                 flash("Add one specific thing you liked before generating a draft.", "error")
                 return redirect(url_for("shortlist_page"))
+            repeat_warning = person["status"] in ("sent", "replied", "agreed")
+            if (
+                channel == "connection"
+                and repeat_warning
+                and request.form.get("confirm_repeat") != "1"
+            ):
+                flash(
+                    "This person is already marked as contacted. Confirm before preparing another connection note.",
+                    "warning",
+                )
+                return redirect(url_for("shortlist_page"))
+            if channel == "connection" and person["verified_status"] == "unverified":
+                flash(
+                    "This profile is not verified yet. Please review it before sending any message.",
+                    "warning",
+                )
             draft = make_draft(
                 channel,
                 person["name"],
@@ -231,6 +380,7 @@ def create_app(test_config=None):
             person=person,
             channel=channel,
             draft=draft,
+            repeat_warning=repeat_warning,
             max_connection_chars=300,
         )
 
@@ -261,27 +411,31 @@ def create_app(test_config=None):
 
     @app.get("/tracker")
     def tracker():
-        status_filter = request.args.get("status", "")
-        if status_filter and status_filter not in STATUSES:
-            abort(400)
+        status_filter, verified_current, batch_filter = parse_tracker_filters(request.args)
+        people = get_tracker_people(
+            db, status_filter, verified_current, batch_filter, order_by="updated_at"
+        )
         with db() as connection:
-            if status_filter:
-                people = connection.execute(
-                    "SELECT * FROM people WHERE status = ? ORDER BY updated_at DESC",
-                    (status_filter,),
-                ).fetchall()
-            else:
-                people = connection.execute(
-                    "SELECT * FROM people ORDER BY updated_at DESC"
-                ).fetchall()
-            sent_today = connection.execute(
-                "SELECT COUNT(*) FROM people WHERE date(sent_at) = date('now')"
-            ).fetchone()[0]
+            batches = connection.execute(
+                "SELECT id, name, is_current FROM batches ORDER BY created_at DESC, id DESC"
+            ).fetchall()
+            sent_timestamps = connection.execute(
+                "SELECT sent_at FROM people WHERE sent_at IS NOT NULL"
+            ).fetchall()
+        sent_today = sum(
+            1
+            for row in sent_timestamps
+            if (sent_time := as_ist_datetime(row["sent_at"])) is not None
+            and sent_time.date() == datetime.now(IST).date()
+        )
         return render_template(
             "tracker.html",
             people=people,
             statuses=STATUSES,
             status_filter=status_filter,
+            verified_current=verified_current,
+            batch_filter=batch_filter,
+            batches=batches,
             sent_today=sent_today,
             warning_threshold=10,
         )
@@ -296,41 +450,88 @@ def create_app(test_config=None):
             flash(f"Notes must be {MAX_NOTE_LENGTH} characters or fewer.", "error")
             return redirect(url_for("tracker"))
         with db() as connection:
-            cursor = connection.execute(
-                """UPDATE people SET status = ?, personal_note = ?,
-                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
-                    sent_at = CASE
-                        WHEN ? = 'sent' AND status != 'sent'
-                        THEN strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-                        ELSE sent_at
-                    END
-                    WHERE id = ?""",
-                (status, note, status, person_id),
-            )
-        if not cursor.rowcount:
-            abort(404)
+            person = connection.execute(
+                "SELECT status FROM people WHERE id = ?", (person_id,)
+            ).fetchone()
+            if person is None:
+                abort(404)
+            timestamp = ist_now()
+            if person["status"] != status:
+                connection.execute(
+                    """UPDATE people SET status = ?, personal_note = ?,
+                       updated_at = ?, status_changed_at = ?,
+                       sent_at = CASE WHEN ? = 'sent' THEN ? ELSE sent_at END
+                       WHERE id = ?""",
+                    (status, note, timestamp, timestamp, status, timestamp, person_id),
+                )
+                connection.execute(
+                    """INSERT INTO status_history
+                       (person_id, old_status, new_status, changed_at)
+                       VALUES (?, ?, ?, ?)""",
+                    (person_id, person["status"], status, timestamp),
+                )
+            else:
+                connection.execute(
+                    "UPDATE people SET personal_note = ?, updated_at = ? WHERE id = ?",
+                    (note, timestamp, person_id),
+                )
         flash("Tracker entry updated.", "success")
-        return redirect(url_for("tracker", status=status_filter_value(request.form)))
+        return redirect(
+            url_for(
+                "tracker",
+                status=status_filter_value(request.form),
+                verified_current="1"
+                if request.form.get("return_verified_current") == "1"
+                else "",
+                batch=request.form.get("return_batch", ""),
+            )
+        )
 
     @app.get("/export.csv")
     def export_csv():
-        with db() as connection:
-            people = connection.execute(
-                "SELECT name, headline, snippet, url, college, source, personal_note, "
-                "status, created_at, updated_at, sent_at FROM people ORDER BY created_at DESC"
-            ).fetchall()
+        status_filter, verified_current, batch_filter = parse_tracker_filters(request.args)
+        people = get_tracker_people(
+            db, status_filter, verified_current, batch_filter, order_by="created_at"
+        )
         output = io.StringIO(newline="")
         writer = csv.writer(output)
         writer.writerow(
-            ["Name", "Headline", "Snippet", "Profile URL", "College", "Source",
-             "Personal note", "Status", "Created at", "Updated at", "Sent at"]
+            ["Name", "Headline", "Snippet", "Profile URL", "Organisation type",
+             "Organisation name", "Search status hint", "Search years",
+             "Verified status", "Verification note", "Source", "Personal note",
+             "Status", "Draft", "Created at", "Updated at", "Sent at", "Batch",
+             "Last status change", "Removed from shortlist"]
+        )
+        csv_fields = (
+            "name", "headline", "snippet", "url", "org_type", "org_name",
+            "status_hint", "years_text", "verified_status", "verified_note",
+            "source", "personal_note", "status", "draft", "created_at",
+            "updated_at", "sent_at", "batch_name", "status_changed_at",
+            "removed_from_shortlist",
         )
         for person in people:
-            writer.writerow([csv_safe(person[key]) for key in person.keys()])
+            writer.writerow([csv_safe(person[key]) for key in csv_fields])
         return Response(
             "\ufeff" + output.getvalue(),
             mimetype="text/csv",
             headers={"Content-Disposition": "attachment; filename=editorscout-tracker.csv"},
+        )
+
+    @app.get("/export.xlsx")
+    def export_xlsx():
+        status_filter, verified_current, batch_filter = parse_tracker_filters(request.args)
+        people = get_tracker_people(
+            db, status_filter, verified_current, batch_filter, order_by="created_at"
+        )
+        output = build_workbook(people)
+        return Response(
+            output.getvalue(),
+            mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={
+                "Content-Disposition": (
+                    f"attachment; filename=editorscout_{date.today():%Y-%m-%d}.xlsx"
+                )
+            },
         )
 
     return app
@@ -339,24 +540,98 @@ def create_app(test_config=None):
 def normalize_filters(form):
     per_page_raw = form.get("per_page", "10")
     per_page = int(per_page_raw) if per_page_raw in ("5", "10") else 10
+    mode = clean_search_input(form.get("mode", "browse")).lower()
+    if mode not in ("browse", "person"):
+        mode = "browse"
+    person_input = clean_search_input(form.get("person_input", ""))
+    parsed_person = parse_person_input(person_input) if person_input else None
+    if parsed_person and parsed_person["kind"] == "invalid":
+        raise ValueError("That LinkedIn URL is not a valid /in/ profile URL.")
+    org_type = clean_search_input(form.get("org_type", "")).lower()
+    if org_type not in ORG_TYPES:
+        org_type = ""
+    filter_status = clean_search_input(form.get("filter_status", "any")).lower()
+    if filter_status not in FILTER_STATUSES:
+        filter_status = "any"
+    batch_year = clean_search_input(form.get("batch_year", ""))
+    if not (len(batch_year) == 4 and batch_year.isdigit()):
+        batch_year = ""
+    role = clean_search_input(form.get("role", ""))
+    city = clean_search_input(form.get("city", ""))
+    raw_org_name = clean_search_input(form.get("org_name", ""))
+    org_name = raw_org_name if org_type else ""
+    exclude_words = clean_search_input(
+        form.get("exclude_words", DEFAULT_EXCLUDES)
+    )
+    if mode == "browse" and not role:
+        role = ROLES[0]
     return {
-        "role": form.get("role", ROLES[0]).strip()[:80],
-        "city": form.get("city", "Coimbatore").strip()[:80],
-        "college": (
-            form.get("college_custom", "").strip()[:120]
-            or form.get("college", "").strip()[:120]
-        ),
-        "exclude_words": form.get("exclude_words", DEFAULT_EXCLUDES).strip()[:200],
+        "mode": mode,
+        "person_input": person_input,
+        "person_kind": parsed_person["kind"] if parsed_person else "",
+        "person_slug": parsed_person.get("slug", "") if parsed_person else "",
+        "role": role,
+        "city": city,
+        "org_type": org_type,
+        "org_name": org_name,
+        "filter_status": filter_status,
+        "batch_year": batch_year if org_type in ("college", "school") else "",
+        "exclude_words": exclude_words,
         "per_page": per_page,
     }
 
 
+def clean_search_input(value):
+    text = " ".join(str(value or "").split())
+    if len(text) > MAX_SEARCH_TEXT_LENGTH:
+        raise ValueError(
+            f"Search fields must be {MAX_SEARCH_TEXT_LENGTH} characters or fewer."
+        )
+    return text
+
+
+def normalize_page_size(value):
+    return int(value) if value in ("5", "10") else 10
+
+
+def quote_search_term(value):
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def escape_query_fragment(value):
+    return value.replace("\\", "\\\\").replace('"', '\\"')
+
+
 def build_query(filters):
-    terms = ["site:linkedin.com/in", f'"{filters["role"]}"', filters["city"]]
-    if filters["college"]:
-        terms.append(f'"{filters["college"]}"')
+    if filters.get("mode") == "person":
+        if filters.get("person_kind") == "profile":
+            terms = [f'linkedin.com/in/{filters["person_slug"]}']
+            if filters.get("role"):
+                terms.append(quote_search_term(filters["role"]))
+            if filters.get("city"):
+                terms.append(escape_query_fragment(filters["city"]))
+        else:
+            terms = ["site:linkedin.com/in", quote_search_term(filters["person_input"])]
+            if filters.get("role"):
+                terms.append(quote_search_term(filters["role"]))
+            if filters.get("city"):
+                terms.append(escape_query_fragment(filters["city"]))
+    else:
+        terms = [
+            "site:linkedin.com/in",
+            quote_search_term(filters["role"]),
+            escape_query_fragment(filters["city"]),
+        ]
+    if filters["org_name"]:
+        terms.append(quote_search_term(filters["org_name"]))
+    if filters["filter_status"] == "current":
+        terms.append("Present")
+        if filters["org_type"] in ("college", "school") and filters["batch_year"]:
+            terms.append(filters["batch_year"])
+    elif filters["filter_status"] == "past":
+        terms.append("-Present")
     terms.extend(
-        f"-{word.strip()}"
+        f"-{word.strip().replace(chr(34), '')}"
         for word in filters["exclude_words"].split(",")
         if word.strip()
     )
@@ -370,33 +645,7 @@ def parse_page(value):
         return 1
 
 
-def normalize_linkedin_url(url):
-    if not isinstance(url, str):
-        return None
-    try:
-        parsed = urlsplit(url.strip())
-        host = parsed.hostname.lower() if parsed.hostname else ""
-        port = parsed.port
-    except ValueError:
-        return None
-    if (
-        parsed.scheme.lower() not in ("http", "https")
-        or parsed.username
-        or parsed.password
-        or (host != "linkedin.com" and not host.endswith(".linkedin.com"))
-        or (port is not None and port not in (80, 443))
-    ):
-        return None
-    path_parts = [unquote(part) for part in parsed.path.strip("/").split("/")]
-    if len(path_parts) != 2 or path_parts[0].lower() != "in":
-        return None
-    slug = path_parts[1].strip()
-    if not slug or "/" in slug or "\\" in slug:
-        return None
-    return f"https://www.linkedin.com/in/{quote(slug, safe='-._~')}"
-
-
-def shape_results(items, college):
+def shape_results(items, filters):
     shaped = []
     seen = set()
     for item in items:
@@ -408,25 +657,115 @@ def shape_results(items, college):
         seen.add(url)
         title = str(item.get("title") or "").strip()
         name, _, headline = title.partition(" - ")
+        affiliation = analyze_affiliation(
+            title, str(item.get("snippet") or ""), filters["org_name"]
+        )
         shaped.append(
             {
                 "name": name or "LinkedIn profile",
                 "headline": headline,
                 "snippet": str(item.get("snippet") or "").strip(),
                 "url": url,
-                "college": college,
+                "org_type": filters["org_type"],
+                "org_name": filters["org_name"],
+                **affiliation,
             }
         )
     return shaped
 
 
-def get_saved_urls(db_factory):
+def get_saved_people_by_url(db_factory):
     with db_factory() as connection:
-        return {
-            normalized_url
-            for row in connection.execute("SELECT url FROM people").fetchall()
-            if (normalized_url := normalize_linkedin_url(row["url"])) is not None
-        }
+        rows = connection.execute(
+            """SELECT p.id, p.url, p.status, p.batch_id, b.name AS batch_name
+               FROM people p LEFT JOIN batches b ON b.id = p.batch_id"""
+        ).fetchall()
+    saved = {}
+    for row in rows:
+        normalized = normalize_linkedin_url(row["url"])
+        if normalized and normalized not in saved:
+            saved[normalized] = {
+                "id": row["id"],
+                "status": row["status"],
+                "batch_name": row["batch_name"] or "Earlier outreach",
+            }
+    return saved
+
+
+def ist_now():
+    return datetime.now(IST).isoformat(timespec="seconds")
+
+
+def as_ist_datetime(value):
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=IST)
+    return parsed.astimezone(IST)
+
+
+def create_batch(connection):
+    timestamp = ist_now()
+    name = f"Batch {datetime.now(IST):%Y-%m-%d %H:%M}"
+    cursor = connection.execute(
+        "INSERT INTO batches (name, created_at, is_current) VALUES (?, ?, 1)",
+        (name, timestamp),
+    )
+    return cursor.lastrowid
+
+
+def ensure_current_batch(connection):
+    current = connection.execute(
+        "SELECT id FROM batches WHERE is_current = 1 ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    return current["id"] if current else create_batch(connection)
+
+
+def get_cached_results(db_factory, query, page, per_page):
+    now = time.time()
+    with db_factory() as connection:
+        row = connection.execute(
+            """SELECT results_json, cached_at FROM search_cache
+               WHERE query = ? AND page = ? AND per_page = ?""",
+            (query, page, per_page),
+        ).fetchone()
+        if row is None:
+            return None
+        if now - row["cached_at"] > SEARCH_CACHE_SECONDS:
+            connection.execute(
+                "DELETE FROM search_cache WHERE query = ? AND page = ? AND per_page = ?",
+                (query, page, per_page),
+            )
+            return None
+        try:
+            results = json.loads(row["results_json"])
+        except (json.JSONDecodeError, TypeError):
+            connection.execute(
+                "DELETE FROM search_cache WHERE query = ? AND page = ? AND per_page = ?",
+                (query, page, per_page),
+            )
+            return None
+        if not isinstance(results, list):
+            connection.execute(
+                "DELETE FROM search_cache WHERE query = ? AND page = ? AND per_page = ?",
+                (query, page, per_page),
+            )
+            return None
+        return results
+
+
+def save_cached_results(db_factory, query, page, per_page, results):
+    with db_factory() as connection:
+        connection.execute(
+            """INSERT OR REPLACE INTO search_cache
+               (query, page, per_page, results_json, cached_at)
+               VALUES (?, ?, ?, ?, ?)""",
+            (query, page, per_page, json.dumps(results), time.time()),
+        )
 
 
 def make_draft(channel, name, personal_note, one_liner, offer):
@@ -451,6 +790,59 @@ def csv_safe(value):
     if text.lstrip().startswith(("=", "+", "-", "@")):
         return "'" + text
     return text
+
+
+def parse_tracker_filters(args):
+    status_filter = args.get("status", "")
+    verified_current = args.get("verified_current") == "1"
+    if status_filter and status_filter not in STATUSES:
+        abort(400)
+    batch_filter = args.get("batch", "")
+    if batch_filter not in ("", "current") and not batch_filter.isdigit():
+        abort(400)
+    if batch_filter.isdigit() and int(batch_filter) < 1:
+        abort(400)
+    return status_filter, verified_current, batch_filter
+
+
+def get_tracker_people(
+    db_factory,
+    status_filter="",
+    verified_current=False,
+    batch_filter="",
+    order_by="updated_at",
+):
+    if order_by not in ("created_at", "updated_at"):
+        raise ValueError(f"Unsupported tracker sort column: {order_by}")
+    conditions = []
+    parameters = []
+    if status_filter:
+        conditions.append("p.status = ?")
+        parameters.append(status_filter)
+    if verified_current:
+        conditions.append("p.verified_status = 'current'")
+    if batch_filter == "current":
+        conditions.append("b.is_current = 1")
+    elif batch_filter:
+        conditions.append("p.batch_id = ?")
+        parameters.append(int(batch_filter))
+    where_clause = f" WHERE {' AND '.join(conditions)}" if conditions else ""
+    query = (
+        "SELECT p.id, p.name, p.headline, p.snippet, p.url, p.org_type, p.org_name, "
+        "p.status_hint, p.years_text, p.verified_status, p.verified_note, "
+        "p.source, p.status, p.personal_note, "
+        "(SELECT m.draft_text FROM messages m WHERE m.person_id = p.id "
+        "ORDER BY m.created_at DESC, m.id DESC LIMIT 1) AS draft, "
+        "p.created_at, p.updated_at, p.sent_at, p.batch_id, "
+        "p.shortlisted_at, p.status_changed_at, p.removed_from_shortlist, "
+        "b.name AS batch_name, "
+        "(SELECT h.changed_at FROM status_history h WHERE h.person_id = p.id "
+        "ORDER BY h.changed_at DESC, h.id DESC LIMIT 1) AS last_status_changed_at "
+        "FROM people p LEFT JOIN batches b ON b.id = p.batch_id"
+        f"{where_clause} ORDER BY p.{order_by} DESC"
+    )
+    with db_factory() as connection:
+        return connection.execute(query, parameters).fetchall()
 
 
 def status_filter_value(form):

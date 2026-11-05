@@ -6,6 +6,9 @@
   <h1>{% if channel == 'connection' %}Connection note{% else %}Follow-up pitch{% endif %}</h1>
   <p>For <a href="{{ person.url }}" target="_blank" rel="noopener noreferrer">{{ person.name }}</a>. Review and edit this message before copying it.</p>
 </section>
+{% if repeat_warning %}
+  <p class="warning-banner">This person is already marked {{ person.status }}. Review the history carefully; preparing this draft does not send it.</p>
+{% endif %}
 <section class="panel draft-panel">
   <form method="post" action="{{ url_for('save_draft', person_id=person.id) }}">
     <input type="hidden" name="channel" value="{{ channel }}">
