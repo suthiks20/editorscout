@@ -4,7 +4,7 @@
 <section class="page-heading">
   <p class="eyebrow">DISCOVER</p>
   <h1>Find your next creative collaborator.</h1>
-  <p>Search public Google results for Coimbatore-based video talent. Review profiles yourself before reaching out.</p>
+  <p>Search public web results for Coimbatore-based video talent. Review profiles yourself before reaching out.</p>
 </section>
 
 <form class="panel search-form" action="{{ url_for('search') }}" method="post">
@@ -40,8 +40,8 @@
       </select>
     </label>
   </div>
-  <button class="button button-primary" type="submit">Search Google</button>
-  <p class="form-footnote">Searches Google Programmable Search only. No LinkedIn credentials or browser automation.</p>
+  <button class="button button-primary" type="submit">Search public web results</button>
+  <p class="form-footnote">Searches public web results only. No LinkedIn credentials or browser automation.</p>
 </form>
 
 {% if results is not none %}
@@ -83,7 +83,7 @@
     {% else %}
       <div class="empty-state">
         <strong>No new profiles on this page.</strong>
-        <p>They may already be saved, or Google returned no matching profiles. Try another page or adjust your filters.</p>
+        <p>They may already be saved, or the search returned no matching profiles. Try another page or adjust your filters.</p>
       </div>
     {% endif %}
     {% if page > 1 or next_page %}

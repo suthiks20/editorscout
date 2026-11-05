@@ -1,8 +1,8 @@
 import csv
 import io
 import json
+from urllib.parse import quote, unquote, urlsplit
 
-import requests
 from flask import (
     Flask,
     Response,
@@ -17,6 +17,13 @@ from flask import (
 
 from config import Config
 from database import connect, init_db
+from search_provider import (
+    SearchAPIError,
+    SearchConnectionError,
+    SearchResponseError,
+    SearchTimeoutError,
+    search_web,
+)
 
 STATUSES = ("new", "shortlisted", "sent", "replied", "agreed", "rejected")
 ROLES = (
@@ -81,62 +88,32 @@ def create_app(test_config=None):
             ), 400
 
         page = parse_page(request.form.get("page"))
-        start = (page - 1) * filters["per_page"] + 1
-        if start > 91:
-            flash("Google Custom Search supports result starts only through 91.", "error")
-            return redirect(url_for("search_page"))
-
         query = build_query(filters)
         results = []
-        total_results = 0
         next_page = False
         api_error = None
 
-        if not app.config["GOOGLE_API_KEY"] or not app.config["GOOGLE_CX"]:
-            api_error = "Add GOOGLE_API_KEY and GOOGLE_CX to your .env file to search."
-        else:
-            try:
-                response = requests.get(
-                    app.config["GOOGLE_CSE_URL"],
-                    params={
-                        "key": app.config["GOOGLE_API_KEY"],
-                        "cx": app.config["GOOGLE_CX"],
-                        "q": query,
-                        "start": start,
-                        "num": filters["per_page"],
-                    },
-                    timeout=app.config["GOOGLE_TIMEOUT_SECONDS"],
-                )
-                if response.status_code == 429:
-                    api_error = (
-                        "Google Search is temporarily rate-limited or its daily quota "
-                        "is exhausted. Please try again later."
-                    )
-                else:
-                    payload = response.json()
-                    if not isinstance(payload, dict):
-                        api_error = "Google Search returned an unreadable response. Please try again."
-                    elif has_quota_error(payload):
-                        api_error = (
-                            "Google Search is temporarily rate-limited or its daily quota "
-                            "is exhausted. Please try again later."
-                        )
-                    elif not response.ok:
-                        api_error = "Google Search could not complete this request. Please try again."
-                    else:
-                        api_items = payload.get("items", [])
-                        total_results = safe_total_results(payload)
-                        results = shape_results(api_items, filters["college"])
-                        next_page = bool(
-                            payload.get("queries", {}).get("nextPage")
-                            and start + filters["per_page"] <= 91
-                        )
-            except requests.Timeout:
-                api_error = "Google Search timed out. Please try again."
-            except requests.RequestException:
-                api_error = "Could not reach Google Search. Check your connection and try again."
-            except (ValueError, TypeError):
-                api_error = "Google Search returned an unreadable response. Please try again."
+        try:
+            provider_results = search_web(
+                query, num=filters["per_page"], page=page
+            )
+            results = shape_results(provider_results, filters["college"])
+            next_page = len(provider_results) == filters["per_page"] and page < 10
+        except RuntimeError as exc:
+            api_error = str(exc)
+        except SearchAPIError as exc:
+            if exc.status_code in (401, 403):
+                api_error = "Serper rejected the API key. Check SERPER_API_KEY in your .env file."
+            elif exc.status_code == 429:
+                api_error = "Serper rate limit reached or search credits exhausted. Please try again later."
+            else:
+                api_error = "Serper search could not complete this request. Please try again."
+        except SearchTimeoutError:
+            api_error = "Serper search timed out. Please try again."
+        except SearchConnectionError:
+            api_error = "Could not connect to Serper. Check your connection and try again."
+        except SearchResponseError:
+            api_error = "Serper returned an unreadable response. Please try again."
 
         saved_urls = get_saved_urls(db)
         results = [item for item in results if item["url"] not in saved_urls]
@@ -160,7 +137,6 @@ def create_app(test_config=None):
             page=page,
             per_page=filters["per_page"],
             next_page=next_page,
-            total_results=total_results,
             search_query=query,
         )
 
@@ -179,17 +155,17 @@ def create_app(test_config=None):
             for item in selected:
                 if not isinstance(item, dict):
                     abort(400)
-                url = str(item.get("url", "")).strip()
-                if not url.startswith("https://www.linkedin.com/in/"):
+                url = normalize_linkedin_url(item.get("url", ""))
+                if url is None:
                     abort(400)
                 cursor = connection.execute(
                     """INSERT OR IGNORE INTO people
-                        (name, headline, snippet, url, college, status)
-                        VALUES (?, ?, ?, ?, ?, 'shortlisted')""",
+                        (name, headline, snippet, url, college, source, status)
+                        VALUES (?, ?, ?, ?, ?, 'Serper.dev', 'shortlisted')""",
                     (
-                        str(item.get("name", "LinkedIn profile"))[:200],
-                        str(item.get("headline", ""))[:500],
-                        str(item.get("snippet", ""))[:2000],
+                        str(item.get("name") or "LinkedIn profile")[:200],
+                        str(item.get("headline") or "")[:500],
+                        str(item.get("snippet") or "")[:2000],
                         url[:500],
                         str(item.get("college", ""))[:120],
                     ),
@@ -389,53 +365,54 @@ def build_query(filters):
 
 def parse_page(value):
     try:
-        return max(1, min(int(value or "1"), 19))
+        return max(1, min(int(value or "1"), 10))
     except ValueError:
         return 1
 
 
-def has_quota_error(payload):
-    error = payload.get("error", {})
-    if not isinstance(error, dict):
-        return False
-    errors = error.get("errors", [])
-    if not isinstance(errors, list):
-        return False
-    reasons = {error.get("reason", "") for error in errors}
-    return bool(
-        reasons.intersection(
-            {
-                "rateLimitExceeded",
-                "userRateLimitExceeded",
-                "dailyLimitExceeded",
-                "quotaExceeded",
-            }
-        )
-    )
-
-
-def safe_total_results(payload):
+def normalize_linkedin_url(url):
+    if not isinstance(url, str):
+        return None
     try:
-        return int(payload.get("searchInformation", {}).get("totalResults", 0))
-    except (TypeError, ValueError):
-        return 0
+        parsed = urlsplit(url.strip())
+        host = parsed.hostname.lower() if parsed.hostname else ""
+        port = parsed.port
+    except ValueError:
+        return None
+    if (
+        parsed.scheme.lower() not in ("http", "https")
+        or parsed.username
+        or parsed.password
+        or (host != "linkedin.com" and not host.endswith(".linkedin.com"))
+        or (port is not None and port not in (80, 443))
+    ):
+        return None
+    path_parts = [unquote(part) for part in parsed.path.strip("/").split("/")]
+    if len(path_parts) != 2 or path_parts[0].lower() != "in":
+        return None
+    slug = path_parts[1].strip()
+    if not slug or "/" in slug or "\\" in slug:
+        return None
+    return f"https://www.linkedin.com/in/{quote(slug, safe='-._~')}"
 
 
 def shape_results(items, college):
     shaped = []
     seen = set()
     for item in items:
-        url = item.get("link", "").strip()
-        if not url.startswith("https://www.linkedin.com/in/") or url in seen:
+        if not isinstance(item, dict):
+            continue
+        url = normalize_linkedin_url(item.get("link", ""))
+        if url is None or url in seen:
             continue
         seen.add(url)
-        title = item.get("title", "").strip()
+        title = str(item.get("title") or "").strip()
         name, _, headline = title.partition(" - ")
         shaped.append(
             {
                 "name": name or "LinkedIn profile",
                 "headline": headline,
-                "snippet": item.get("snippet", "").strip(),
+                "snippet": str(item.get("snippet") or "").strip(),
                 "url": url,
                 "college": college,
             }
@@ -446,8 +423,9 @@ def shape_results(items, college):
 def get_saved_urls(db_factory):
     with db_factory() as connection:
         return {
-            row["url"]
+            normalized_url
             for row in connection.execute("SELECT url FROM people").fetchall()
+            if (normalized_url := normalize_linkedin_url(row["url"])) is not None
         }
 
 
