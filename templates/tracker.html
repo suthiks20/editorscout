@@ -1,0 +1,55 @@
+{% extends "base.html" %}
+{% block title %}Tracker · EditorScout{% endblock %}
+{% block content %}
+<section class="page-heading tracker-heading">
+  <div>
+    <p class="eyebrow">OUTREACH LOG</p>
+    <h1>Tracker</h1>
+    <p>Keep your outreach thoughtful and record each status yourself.</p>
+  </div>
+  <a class="button button-secondary" href="{{ url_for('export_csv') }}">Export CSV</a>
+</section>
+<div class="daily-count {% if sent_today > warning_threshold %}daily-count-warning{% endif %}">
+  <span class="count-number">{{ sent_today }}</span>
+  <span>manually marked sent today</span>
+  {% if sent_today > warning_threshold %}<strong>You've passed 10 today. Consider pausing and personalizing your next outreach.</strong>{% else %}<span class="muted">Daily guideline: 10</span>{% endif %}
+</div>
+<form class="filter-row" method="get" action="{{ url_for('tracker') }}">
+  <label for="status-filter">Filter by status</label>
+  <select id="status-filter" name="status" onchange="this.form.submit()">
+    <option value="">All statuses</option>
+    {% for status in statuses %}<option value="{{ status }}" {% if status_filter == status %}selected{% endif %}>{{ status|title }}</option>{% endfor %}
+  </select>
+</form>
+{% if people %}
+  <div class="card-list">
+    {% for person in people %}
+      <article class="person-card tracker-card">
+        <div class="person-card-heading">
+          <div>
+            <a class="profile-name" href="{{ person.url }}" target="_blank" rel="noopener noreferrer">{{ person.name }}</a>
+            {% if person.headline %}<p class="profile-headline">{{ person.headline }}</p>{% endif %}
+          </div>
+          <span class="status-pill status-{{ person.status }}">{{ person.status|title }}</span>
+        </div>
+        {% if person.college %}<span class="tag">{{ person.college }}</span>{% endif %}
+        <p class="muted small">Added {{ person.created_at[:10] }}{% if person.sent_at %} · Sent {{ person.sent_at[:10] }}{% endif %}</p>
+        <form class="tracker-edit" method="post" action="{{ url_for('update_person', person_id=person.id) }}">
+          <input type="hidden" name="return_status" value="{{ status_filter }}">
+          <label>Status
+            <select name="status">
+              {% for status in statuses %}<option value="{{ status }}" {% if person.status == status %}selected{% endif %}>{{ status|title }}</option>{% endfor %}
+            </select>
+          </label>
+          <label>Personal note
+            <textarea name="personal_note" maxlength="1000" rows="2">{{ person.personal_note }}</textarea>
+          </label>
+          <button class="button button-secondary" type="submit">Save changes</button>
+        </form>
+      </article>
+    {% endfor %}
+  </div>
+{% else %}
+  <div class="empty-state"><strong>No tracker entries{% if status_filter %} with this status{% endif %}.</strong><p>Profiles you shortlist will appear here.</p><a class="button button-primary" href="{{ url_for('search_page') }}">Find creators</a></div>
+{% endif %}
+{% endblock %}

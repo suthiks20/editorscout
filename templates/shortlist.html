@@ -1,0 +1,43 @@
+{% extends "base.html" %}
+{% block title %}Shortlist · EditorScout{% endblock %}
+{% block content %}
+<section class="page-heading">
+  <p class="eyebrow">YOUR PICKS</p>
+  <h1>Shortlist</h1>
+  <p>Note what stood out, then prepare a personal draft. You decide if and when to send it.</p>
+</section>
+{% if people %}
+  <div class="card-list">
+    {% for person in people %}
+      <article class="person-card">
+        <div class="person-card-heading">
+          <div>
+            <a class="profile-name" href="{{ person.url }}" target="_blank" rel="noopener noreferrer">{{ person.name }}</a>
+            {% if person.headline %}<p class="profile-headline">{{ person.headline }}</p>{% endif %}
+          </div>
+          {% if person.college %}<span class="tag">{{ person.college }}</span>{% endif %}
+        </div>
+        {% if person.snippet %}<p class="profile-snippet">{{ person.snippet }}</p>{% endif %}
+        <form class="note-form" method="post" action="{{ url_for('save_person', person_id=person.id) }}">
+          <label>One specific thing I liked about their work
+            <textarea name="personal_note" maxlength="1000" required placeholder="For example: the pacing and color work in their Coimbatore food reel">{{ person.personal_note }}</textarea>
+          </label>
+          <button class="button button-secondary" type="submit">Save note</button>
+        </form>
+        <div class="draft-actions">
+          <form method="post" action="{{ url_for('generate_draft', person_id=person.id) }}">
+            <input type="hidden" name="channel" value="connection">
+            <button class="button button-primary" type="submit">Draft connection note</button>
+          </form>
+          <form method="post" action="{{ url_for('generate_draft', person_id=person.id) }}">
+            <input type="hidden" name="channel" value="follow_up">
+            <button class="button button-secondary" type="submit">Draft follow-up pitch</button>
+          </form>
+        </div>
+      </article>
+    {% endfor %}
+  </div>
+{% else %}
+  <div class="empty-state"><strong>Your shortlist is empty.</strong><p>Search for creators and add profiles you want to review.</p><a class="button button-primary" href="{{ url_for('search_page') }}">Find creators</a></div>
+{% endif %}
+{% endblock %}

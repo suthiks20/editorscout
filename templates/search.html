@@ -1,0 +1,110 @@
+{% extends "base.html" %}
+{% block title %}Discover creators · EditorScout{% endblock %}
+{% block content %}
+<section class="page-heading">
+  <p class="eyebrow">DISCOVER</p>
+  <h1>Find your next creative collaborator.</h1>
+  <p>Search public Google results for Coimbatore-based video talent. Review profiles yourself before reaching out.</p>
+</section>
+
+<form class="panel search-form" action="{{ url_for('search') }}" method="post">
+  <div class="form-grid">
+    <label>Role keyword
+      <select name="role" required>
+        {% for role in roles %}
+          <option value="{{ role }}" {% if filters.get('role', roles[0]) == role %}selected{% endif %}>{{ role|title }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label>City
+      <input name="city" value="{{ filters.get('city', 'Coimbatore') }}" maxlength="80" required>
+    </label>
+    <label>College
+      <select name="college">
+        <option value="">Any college</option>
+        {% for college in colleges %}
+          <option value="{{ college }}" {% if filters.get('college') == college %}selected{% endif %}>{{ college }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label>Or enter a college
+      <input name="college_custom" value="{% if filters.get('college') and filters.get('college') not in colleges %}{{ filters.get('college') }}{% endif %}" placeholder="College name" maxlength="120">
+    </label>
+    <label class="span-two">Exclude words <span class="label-hint">comma separated</span>
+      <input name="exclude_words" value="{{ filters.get('exclude_words', default_excludes) }}" maxlength="200">
+    </label>
+    <label>Results per page
+      <select name="per_page">
+        <option value="5" {% if filters.get('per_page', per_page) == 5 or filters.get('per_page') == '5' %}selected{% endif %}>5 results</option>
+        <option value="10" {% if filters.get('per_page', per_page) == 10 or filters.get('per_page') == '10' %}selected{% endif %}>10 results</option>
+      </select>
+    </label>
+  </div>
+  <button class="button button-primary" type="submit">Search Google</button>
+  <p class="form-footnote">Searches Google Programmable Search only. No LinkedIn credentials or browser automation.</p>
+</form>
+
+{% if results is not none %}
+  <section class="results-section">
+    <div class="section-heading">
+      <div>
+        <p class="eyebrow">RESULTS</p>
+        <h2>Search results</h2>
+        <p class="muted">Query: <code>{{ search_query }}</code>{% if total_results %} · About {{ total_results }} results{% endif %}</p>
+      </div>
+      <span class="result-count">{{ results|length }} new profiles</span>
+    </div>
+    {% if results %}
+      <form method="post" action="{{ url_for('shortlist') }}">
+        <div class="table-wrap">
+          <table class="results-table">
+            <thead><tr><th>Shortlist</th><th>Creator</th><th>College</th></tr></thead>
+            <tbody>
+              {% for result in results %}
+                <tr>
+                  <td><input class="profile-check" type="checkbox" name="profile" value="{{ result|tojson|forceescape }}" aria-label="Shortlist {{ result.name }}"></td>
+                  <td>
+                    <a class="profile-name" href="{{ result.url }}" target="_blank" rel="noopener noreferrer">{{ result.name }}</a>
+                    {% if result.headline %}<div class="profile-headline">{{ result.headline }}</div>{% endif %}
+                    {% if result.snippet %}<p class="profile-snippet">{{ result.snippet }}</p>{% endif %}
+                    <a class="external-link" href="{{ result.url }}" target="_blank" rel="noopener noreferrer">Open profile ↗</a>
+                  </td>
+                  <td>{% if result.college %}<span class="tag">{{ result.college }}</span>{% else %}<span class="muted">—</span>{% endif %}</td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+        <div class="table-actions">
+          <button class="button button-primary" type="submit">Add selected to shortlist</button>
+          <span class="muted">Shortlisted profiles are hidden from future searches.</span>
+        </div>
+      </form>
+    {% else %}
+      <div class="empty-state">
+        <strong>No new profiles on this page.</strong>
+        <p>They may already be saved, or Google returned no matching profiles. Try another page or adjust your filters.</p>
+      </div>
+    {% endif %}
+    {% if page > 1 or next_page %}
+      <div class="pagination">
+        {% if page > 1 %}
+          <form method="post" action="{{ url_for('search') }}">
+            {% for key, value in filters.items() %}<input type="hidden" name="{{ key }}" value="{{ value }}">{% endfor %}
+            <input type="hidden" name="page" value="{{ page - 1 }}">
+            <button class="button button-secondary" type="submit">← Previous</button>
+          </form>
+        {% endif %}
+        <span>Page {{ page }}</span>
+        {% if next_page %}
+          <form method="post" action="{{ url_for('search') }}">
+            {% for key, value in filters.items() %}<input type="hidden" name="{{ key }}" value="{{ value }}">{% endfor %}
+            <input type="hidden" name="page" value="{{ page + 1 }}">
+            <button class="button button-secondary" type="submit">Next →</button>
+          </form>
+        {% endif %}
+      </div>
+    {% endif %}
+  </section>
+{% endif %}
+{% endblock %}

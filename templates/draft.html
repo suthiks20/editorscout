@@ -1,0 +1,22 @@
+{% extends "base.html" %}
+{% block title %}Edit draft · EditorScout{% endblock %}
+{% block content %}
+<section class="page-heading">
+  <p class="eyebrow">MANUAL DRAFT</p>
+  <h1>{% if channel == 'connection' %}Connection note{% else %}Follow-up pitch{% endif %}</h1>
+  <p>For <a href="{{ person.url }}" target="_blank" rel="noopener noreferrer">{{ person.name }}</a>. Review and edit this message before copying it.</p>
+</section>
+<section class="panel draft-panel">
+  <form method="post" action="{{ url_for('save_draft', person_id=person.id) }}">
+    <input type="hidden" name="channel" value="{{ channel }}">
+    <label for="draft-text">Editable draft{% if channel == 'connection' %} <span class="label-hint">under 300 characters</span>{% endif %}</label>
+    <textarea id="draft-text" name="draft_text" maxlength="5000" rows="6" required data-char-count>{{ draft }}</textarea>
+    <div class="draft-controls">
+      {% if channel == 'connection' %}<span class="muted"><span data-count-for="draft-text">{{ draft|length }}</span> / 299 characters</span>{% endif %}
+      <button class="button button-secondary" type="button" data-copy-target="draft-text">Copy draft</button>
+      <button class="button button-primary" type="submit">Save edited draft</button>
+    </div>
+    <p class="form-footnote">This only saves or copies a draft. It does not send anything.</p>
+  </form>
+</section>
+{% endblock %}

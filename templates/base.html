@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}EditorScout{% endblock %}</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+  <script src="{{ url_for('static', filename='app.js') }}" defer></script>
+</head>
+<body>
+  <header class="site-header">
+    <a class="brand" href="{{ url_for('search_page') }}"><span class="brand-mark">E</span> EditorScout</a>
+    <nav aria-label="Main navigation">
+      <a href="{{ url_for('search_page') }}">Discover</a>
+      <a href="{{ url_for('shortlist_page') }}">Shortlist</a>
+      <a href="{{ url_for('tracker') }}">Tracker</a>
+    </nav>
+  </header>
+  <main class="page-shell">
+    <div class="manual-note"><strong>Manual outreach only.</strong> Review every profile yourself before contact. EditorScout never logs in to LinkedIn, scrapes profiles, or sends messages.</div>
+    {% with messages = get_flashed_messages(with_categories=true) %}
+      {% if messages %}
+        <div class="flash-list" aria-live="polite">
+          {% for category, message in messages %}
+            <div class="flash flash-{{ category }}">{{ message }}</div>
+          {% endfor %}
+        </div>
+      {% endif %}
+    {% endwith %}
+    {% block content %}{% endblock %}
+  </main>
+  <footer>EditorScout <span>·</span> Find thoughtfully. Reach out personally.</footer>
+</body>
+</html>
