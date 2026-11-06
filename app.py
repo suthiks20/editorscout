@@ -1,6 +1,7 @@
 import csv
 import io
 import json
+import re
 import time
 from datetime import date, datetime, timedelta
 from urllib.parse import parse_qsl, urlsplit
@@ -72,6 +73,57 @@ MAX_DRAFT_LENGTH = 5000
 MAX_SEARCH_TEXT_LENGTH = 100
 SEARCH_CACHE_SECONDS = 10 * 60
 IST = ZoneInfo("Asia/Kolkata")
+
+ROLE_KEYWORDS = (
+    ("Content Creator", ("content creator", "creator", "youtuber", "influencer", "vlogger")),
+    ("Video Editor", ("video editor", "video editing", "editor", "premiere", "final cut", "davinci", "after effects")),
+    ("Videographer", ("videographer", "cinematographer", "filmmaker", "director of photography", "dop")),
+    ("Motion Designer", ("motion graphics", "motion designer", "animator", "vfx")),
+    ("Photographer", ("photographer", "photography")),
+    ("Social Media", ("social media", "content strategist", "content marketing", "community manager")),
+    ("Designer", ("graphic designer", "ui/ux", "designer")),
+)
+STUDY_TEXT = re.compile(
+    r"\b(?:"
+    r"B\.?\s*E\.?|B\.?\s*Tech\.?|M\.?\s*Tech\.?|BSc|MSc|MBA|ECE|EEE|"
+    r"engineering\s+student|CSE\s+student|student(?:\s+at\b|\b)|"
+    r"pursuing\b|bachelor\s+of\b|master\s+of\b"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def detect_role(headline, snippet, org_name=""):
+    """Guess a creative role and clean study-related noise from a headline."""
+    headline = " ".join(str(headline or "").split())
+    snippet = " ".join(str(snippet or "").split())
+    role_label = "Other"
+    for source in (headline, snippet):
+        source_folded = source.casefold()
+        for label, keywords in ROLE_KEYWORDS:
+            if any(
+                re.search(r"(?<!\w)" + re.escape(keyword) + r"(?!\w)", source_folded)
+                for keyword in keywords
+            ):
+                role_label = label
+                break
+        if role_label != "Other":
+            break
+
+    org_folded = " ".join(str(org_name or "").split()).casefold()
+    segments = re.split(r"\s*(?:\||·|•|-)\s*", headline)
+    meaningful = []
+    for segment in segments:
+        segment = " ".join(segment.split()).strip(" ,;:")
+        if not segment or STUDY_TEXT.search(segment):
+            continue
+        if org_folded and segment.casefold() == org_folded:
+            continue
+        meaningful.append(segment)
+        if len(meaningful) == 2:
+            break
+    cleaned_headline = " · ".join(meaningful) or role_label
+    return role_label, cleaned_headline
 
 
 def create_app(test_config=None):
@@ -336,23 +388,19 @@ def create_app(test_config=None):
                         (cursor.lastrowid, timestamp),
                     )
         flash(f"Shortlisted {saved} profile(s).", "success")
-        return redirect(url_for("shortlist_page"))
+        return redirect(shortlist_url(date=datetime.now(IST).date().isoformat()))
 
     @app.get("/shortlist")
     def shortlist_page():
+        selected_date = parse_shortlist_date(request.args.get("date"))
         with db() as connection:
             batch = connection.execute(
                 "SELECT * FROM batches WHERE is_current = 1 ORDER BY id DESC LIMIT 1"
             ).fetchone()
-            people = [
-                dict(person)
-                for person in connection.execute(
-                    """SELECT * FROM people WHERE batch_id = ?
-                       AND removed_from_shortlist = 0
-                       ORDER BY shortlisted_at DESC, id DESC""",
-                    (batch["id"] if batch else -1,),
-                ).fetchall()
-            ]
+            all_people = connection.execute(
+                """SELECT * FROM people WHERE removed_from_shortlist = 0
+                   ORDER BY shortlisted_at DESC, id DESC"""
+            ).fetchall()
             drafts = connection.execute(
                 """SELECT m.* FROM messages m
                    JOIN (
@@ -380,6 +428,13 @@ def create_app(test_config=None):
                    ORDER BY confirmed DESC, found_at DESC, id DESC"""
             ).fetchall():
                 person_links_by_person.setdefault(link["person_id"], []).append(link)
+        date_log = build_date_log(all_people)
+        total_shortlisted = sum(group["count"] for group in date_log)
+        people = [
+            dict(person)
+            for person in all_people
+            if selected_date and shortlist_date_of(person) == selected_date
+        ]
         drafts_by_person = {}
         for draft in drafts:
             drafts_by_person.setdefault(draft["person_id"], {})[draft["channel"]] = dict(draft)
@@ -403,6 +458,10 @@ def create_app(test_config=None):
             people=people,
             batch=batch,
             person_count=len(people),
+            total_shortlisted=total_shortlisted,
+            date_log=date_log,
+            selected_date=selected_date,
+            selected_date_label=format_shortlist_date(selected_date) if selected_date else None,
             person_links_by_person=person_links_by_person,
             common_messages=common_messages,
             my_name=settings.get("my_name", ""),
@@ -411,6 +470,8 @@ def create_app(test_config=None):
             warning_threshold=10,
             sources=SOURCES,
             default_follow_up_date=(datetime.now(IST).date() + timedelta(days=4)).isoformat(),
+            detect_role=detect_role,
+            normalize_manual_instagram_handle=normalize_manual_instagram_handle,
         )
 
     @app.post("/shortlist/messages")
@@ -431,14 +492,18 @@ def create_app(test_config=None):
                 },
             )
             people = connection.execute(
-                """SELECT * FROM people WHERE batch_id = (
-                       SELECT id FROM batches WHERE is_current = 1
-                       ORDER BY id DESC LIMIT 1
-                   ) AND removed_from_shortlist = 0 ORDER BY id"""
+                """SELECT * FROM people WHERE removed_from_shortlist = 0
+                   ORDER BY shortlisted_at DESC, id DESC"""
             ).fetchall()
+            selected_date = parse_shortlist_date(request.form.get("date"))
+            if selected_date:
+                people = [
+                    person for person in people
+                    if shortlist_date_of(person) == selected_date
+                ]
             if request.form.get("action") == "save":
                 flash("Common message and details saved.", "success")
-                return redirect(url_for("shortlist_page"))
+                return redirect(shortlist_url())
 
             if request.form.get("apply_to") == "all":
                 targets = people
@@ -498,7 +563,7 @@ def create_app(test_config=None):
             f"not eligible {skipped_ineligible}).",
             "success",
         )
-        return redirect(url_for("shortlist_page"))
+        return redirect(shortlist_url())
 
     @app.post("/people/<int:person_id>/find-links")
     def find_more_links(person_id):
@@ -514,7 +579,7 @@ def create_app(test_config=None):
             )
         except ValueError as exc:
             flash(str(exc), "error")
-            return redirect(url_for("shortlist_page"))
+            return redirect(shortlist_url())
         found_counts = {}
         errors = {}
         refresh = request.form.get("refresh") == "1"
@@ -566,7 +631,7 @@ def create_app(test_config=None):
                 + ", ".join(f"{key.title()} {value}" for key, value in found_counts.items()),
                 "success",
             )
-        return redirect(url_for("shortlist_page", links_for=person_id))
+        return redirect(shortlist_url(links_for=person_id))
 
     @app.post("/people/<int:person_id>/links/<int:link_id>/confirm")
     def confirm_person_link(person_id, link_id):
@@ -581,7 +646,7 @@ def create_app(test_config=None):
             handle = link["handle"] or instagram_handle_from_url(link["url"])
             if link["platform"] == "instagram" and link["kind"] == "profile" and not handle:
                 flash("This profile suggestion has no valid Instagram handle.", "error")
-                return redirect(url_for("shortlist_page", links_for=person_id))
+                return redirect(shortlist_url(links_for=person_id))
             if link["platform"] == "instagram" and link["kind"] == "profile":
                 connection.execute(
                     """UPDATE person_links SET confirmed = 0
@@ -599,7 +664,7 @@ def create_app(test_config=None):
                     (handle, ist_now(), person_id),
                 )
         flash("Link confirmed after your manual review.", "success")
-        return redirect(url_for("shortlist_page", links_for=person_id))
+        return redirect(shortlist_url(links_for=person_id))
 
     @app.post("/people/<int:person_id>/links/<int:link_id>/dismiss")
     def dismiss_person_link(person_id, link_id):
@@ -611,7 +676,7 @@ def create_app(test_config=None):
             )
         if not cursor.rowcount:
             abort(404)
-        return redirect(url_for("shortlist_page", links_for=person_id))
+        return redirect(shortlist_url(links_for=person_id))
 
     @app.post("/batches/new")
     def start_new_batch():
@@ -619,7 +684,7 @@ def create_app(test_config=None):
             connection.execute("UPDATE batches SET is_current = 0 WHERE is_current = 1")
             batch_id = create_batch(connection)
         flash("Started a new shortlist batch.", "success")
-        return redirect(url_for("shortlist_page", batch=batch_id))
+        return redirect(shortlist_url(batch=batch_id))
 
     @app.post("/people/<int:person_id>/remove")
     def remove_from_shortlist(person_id):
@@ -638,7 +703,7 @@ def create_app(test_config=None):
         if not cursor.rowcount:
             abort(404)
         flash("Removed from the current shortlist; the tracker history is kept.", "success")
-        return redirect(url_for("shortlist_page"))
+        return redirect(shortlist_url())
 
     @app.post("/people/<int:person_id>/save")
     def save_person(person_id):
@@ -647,7 +712,7 @@ def create_app(test_config=None):
         raw_instagram_handle = request.form.get("instagram_handle")
         if len(raw_note) > MAX_NOTE_LENGTH or len(raw_verified_note) > MAX_NOTE_LENGTH:
             flash(f"Notes must be {MAX_NOTE_LENGTH} characters or fewer.", "error")
-            return redirect(url_for("shortlist_page"))
+            return redirect(shortlist_url())
         note = clean_text(raw_note, MAX_NOTE_LENGTH).strip()
         verified_note = clean_text(raw_verified_note, MAX_NOTE_LENGTH).strip()
         with db() as connection:
@@ -670,7 +735,7 @@ def create_app(test_config=None):
                 instagram_handle = normalize_manual_instagram_handle(raw_instagram_handle)
                 if raw_instagram_handle.strip() and not instagram_handle:
                     flash("Enter a valid Instagram @handle or profile URL.", "error")
-                    return redirect(url_for("shortlist_page"))
+                    return redirect(shortlist_url())
             cursor = connection.execute(
                 """UPDATE people SET personal_note = ?, verified_status = ?,
                     verified_note = ?, instagram_handle = ?,
@@ -698,7 +763,7 @@ def create_app(test_config=None):
         if not cursor.rowcount:
             abort(404)
         flash("Notes and verification saved.", "success")
-        return redirect(url_for("shortlist_page"))
+        return redirect(shortlist_url())
 
     @app.post("/people/<int:person_id>/draft")
     def generate_draft(person_id):
@@ -719,7 +784,7 @@ def create_app(test_config=None):
                     "Follow-up drafts are available after the status is connected, replied, or agreed.",
                     "warning",
                 )
-                return redirect(url_for("shortlist_page"))
+                return redirect(shortlist_url())
             repeat_warning = person["status"] in ("sent", "connected", "replied", "agreed")
             if (
                 channel == "connection"
@@ -730,7 +795,7 @@ def create_app(test_config=None):
                     "This person is already marked as contacted. Confirm before preparing another connection note.",
                     "warning",
                 )
-                return redirect(url_for("shortlist_page"))
+                return redirect(shortlist_url())
             if channel == "connection" and person["verified_status"] == "unverified":
                 flash(
                     "This profile is not verified yet. Please review it before sending any message.",
@@ -762,16 +827,16 @@ def create_app(test_config=None):
         raw_draft = request.form.get("draft_text", "").strip()
         if len(raw_draft) > MAX_DRAFT_LENGTH:
             flash(f"Draft must be between 1 and {MAX_DRAFT_LENGTH} characters.", "error")
-            return redirect(url_for("shortlist_page"))
+            return redirect(shortlist_url())
         draft = clean_text(raw_draft, MAX_DRAFT_LENGTH)
         if channel not in ("connection", "follow_up"):
             abort(400)
         if not draft or len(draft) > MAX_DRAFT_LENGTH:
             flash(f"Draft must be between 1 and {MAX_DRAFT_LENGTH} characters.", "error")
-            return redirect(url_for("shortlist_page"))
+            return redirect(shortlist_url())
         if channel == "connection" and len(draft) >= 300:
             flash("Connection notes must be under 300 characters.", "error")
-            return redirect(url_for("shortlist_page"))
+            return redirect(shortlist_url())
         with db() as connection:
             exists = connection.execute(
                 "SELECT 1 FROM people WHERE id = ?", (person_id,)
@@ -784,7 +849,7 @@ def create_app(test_config=None):
                 (person_id, channel, draft),
             )
         flash("Edited draft saved.", "success")
-        return redirect(url_for("shortlist_page"))
+        return redirect(shortlist_url())
 
     @app.post("/people/<int:person_id>/draft/reset")
     def reset_shortlist_draft(person_id):
@@ -804,7 +869,7 @@ def create_app(test_config=None):
                     "Follow-up drafts are available after the status is connected, replied, or agreed.",
                     "warning",
                 )
-                return redirect(url_for("shortlist_page"))
+                return redirect(shortlist_url())
             settings = read_message_settings(connection)
             template = settings.get(f"common_{kind}", COMMON_MESSAGE_DEFAULTS[kind])
             rendered, unknown, _empty = render_message(template, person, settings)
@@ -819,7 +884,7 @@ def create_app(test_config=None):
                 + ", ".join(f"{{{name}}}" for name in unknown),
                 "warning",
             )
-        return redirect(url_for("shortlist_page"))
+        return redirect(shortlist_url())
 
     @app.post("/people/<int:person_id>/sent")
     def mark_message_sent(person_id):
@@ -859,7 +924,7 @@ def create_app(test_config=None):
                     "This message type was already marked sent. Confirm before recording it again.",
                     "warning",
                 )
-                return redirect(url_for("shortlist_page"))
+                return redirect(shortlist_url())
             connection.execute(
                 """UPDATE people SET status = 'sent', sent_at = ?,
                    status_changed_at = ?, updated_at = ?, touch_count = touch_count + 1,
@@ -878,7 +943,7 @@ def create_app(test_config=None):
                 (person_id, kind, sent_text, timestamp),
             )
         flash("Marked as sent. The message was recorded; nothing was sent by the app.", "success")
-        return redirect(url_for("shortlist_page"))
+        return redirect(shortlist_url())
 
     @app.get("/tracker")
     def tracker():
@@ -1038,6 +1103,73 @@ def create_app(test_config=None):
         )
 
     return app
+
+
+def parse_shortlist_date(value):
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = date.fromisoformat(value)
+    except ValueError:
+        return None
+    return parsed.isoformat() if parsed.isoformat() == value else None
+
+
+def shortlist_url(**extra):
+    explicit_date = extra.pop("date", None)
+    date_value = explicit_date if explicit_date is not None else (
+        request.form.get("date") or request.args.get("date")
+    )
+    selected_date = parse_shortlist_date(date_value)
+    parameters = dict(extra)
+    if selected_date:
+        parameters["date"] = selected_date
+    return url_for("shortlist_page", **parameters)
+
+
+def shortlist_date_of(person):
+    timestamp = person["shortlisted_at"] or person["created_at"]
+    parsed = as_ist_datetime(timestamp)
+    return parsed.date().isoformat() if parsed else None
+
+
+def format_shortlist_date(date_text):
+    parsed_text = parse_shortlist_date(date_text)
+    if parsed_text is None:
+        return ""
+    parsed = date.fromisoformat(parsed_text)
+    formatted = parsed.strftime("%a, %d %b %Y")
+    today = datetime.now(IST).date()
+    if parsed == today:
+        return f"Today · {formatted}"
+    if parsed == today - timedelta(days=1):
+        return f"Yesterday · {formatted}"
+    return formatted
+
+
+def build_date_log(people):
+    groups = {}
+    for person in people:
+        date_text = shortlist_date_of(person)
+        if date_text is None:
+            continue
+        group = groups.setdefault(
+            date_text,
+            {"date": date_text, "label": format_shortlist_date(date_text),
+             "count": 0, "sent": 0, "entries": []},
+        )
+        timestamp = as_ist_datetime(person["shortlisted_at"] or person["created_at"])
+        group["count"] += 1
+        if person["status"] != "shortlisted":
+            group["sent"] += 1
+        group["entries"].append(
+            {
+                "time": timestamp.strftime("%I:%M %p").lstrip("0") if timestamp else "",
+                "name": person["name"],
+                "status": person["status"],
+            }
+        )
+    return sorted(groups.values(), key=lambda group: group["date"], reverse=True)
 
 
 def normalize_filters(form):

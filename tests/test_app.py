@@ -1,4 +1,5 @@
 import json
+import re
 import sqlite3
 import tempfile
 import unittest
@@ -8,7 +9,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 from unittest.mock import patch
 
-from app import build_query, create_app, normalize_filters
+from app import build_query, create_app, detect_role, normalize_filters
 from database import connect, init_db
 from openpyxl import load_workbook
 from search_provider import (
@@ -17,6 +18,29 @@ from search_provider import (
     SearchResponseError,
     SearchTimeoutError,
 )
+
+
+class RoleDetectionTests(unittest.TestCase):
+    def test_role_priority_and_cleaned_headline(self):
+        self.assertEqual(
+            detect_role("Video Editor | Stayin PSG ...", "")[0],
+            "Video Editor",
+        )
+        self.assertEqual(
+            detect_role("Content Creator & YouTuber", "")[0],
+            "Content Creator",
+        )
+
+    def test_study_text_is_removed_and_empty_headline_has_fallback(self):
+        role, cleaned = detect_role("Electrical & Electronics Engineering Student", "")
+        self.assertEqual(role, "Other")
+        self.assertNotIn("Engineering", cleaned)
+        self.assertNotIn("Student", cleaned)
+
+        _, cleaned = detect_role("CSE Student at PSG iTech | NextWork Learner", "")
+        self.assertNotIn("CSE", cleaned)
+        self.assertNotIn("Student", cleaned)
+        self.assertEqual(detect_role("", "")[1], "Other")
 
 
 class EditorScoutTests(unittest.TestCase):
@@ -59,6 +83,10 @@ class EditorScoutTests(unittest.TestCase):
                     "UPDATE people SET status = ? WHERE id = ?", (status, row["id"])
                 )
         return row["id"]
+
+    def today_shortlist_url(self):
+        today = datetime.now(ZoneInfo("Asia/Kolkata")).date().isoformat()
+        return f"/shortlist?date={today}"
 
     def test_primary_pages_render(self):
         for path in ("/", "/shortlist", "/tracker"):
@@ -643,14 +671,16 @@ class EditorScoutTests(unittest.TestCase):
                 ).fetchone()[0],
                 1,
             )
-        self.assertIn(b"First", self.client.get("/shortlist").data)
+        date_list = self.client.get("/shortlist")
+        self.assertIn(b"First", date_list.data)
+        self.assertIn(b"Today", date_list.data)
 
         self.client.post("/batches/new")
         second = {"name": "Second", "url": "https://www.linkedin.com/in/second-123"}
         self.client.post("/shortlist", data={"profile": json.dumps(second)})
-        shortlist = self.client.get("/shortlist")
+        shortlist = self.client.get(self.today_shortlist_url())
         self.assertIn(b"Second", shortlist.data)
-        self.assertNotIn(b">First<", shortlist.data)
+        self.assertIn(b"First", shortlist.data)
         tracker = self.client.get("/tracker")
         self.assertIn(b"First", tracker.data)
         self.assertIn(b"Second", tracker.data)
@@ -661,6 +691,162 @@ class EditorScoutTests(unittest.TestCase):
         self.assertIn(b"Second", current_only.data)
         self.assertNotIn(b"First", current_only.data)
 
+    def test_shortlist_is_listed_by_date_and_filtered_on_click(self):
+        backdated_id = self.shortlist_profile("Backdated Person", "backdated-person-123")
+        today_id = self.shortlist_profile("Today Person", "today-person-123")
+        with connect(self.database_path) as connection:
+            connection.execute(
+                "UPDATE people SET shortlisted_at = ? WHERE id = ?",
+                ("2026-11-03T10:15:00+05:30", backdated_id),
+            )
+        date_list = self.client.get("/shortlist")
+        self.assertEqual(date_list.status_code, 200)
+        self.assertIn(b"03 Nov 2026", date_list.data)
+        self.assertIn(b"10:15 AM", date_list.data)
+        self.assertNotIn(b'class="person-card shortlist-person-card"', date_list.data)
+        self.assertIn(b"Pick a date", date_list.data)
+
+        selected = self.client.get("/shortlist?date=2026-11-03")
+        self.assertEqual(selected.status_code, 200)
+        self.assertIn(b"Backdated Person", selected.data)
+        self.assertNotIn(b"Today Person", selected.data)
+        self.assertIn(b"All dates", selected.data)
+        self.assertIn(b"2 shortlisted in total", selected.data)
+        self.assertIn(b"showing 1 on Tue, 03 Nov 2026", selected.data)
+        self.assertNotEqual(backdated_id, today_id)
+
+        invalid = self.client.get("/shortlist?date=garbage")
+        self.assertEqual(invalid.status_code, 200)
+        self.assertIn(b"Pick a date", invalid.data)
+        self.assertNotIn(b'id="common-message-form"', invalid.data)
+
+    def test_shortlist_rows_show_role_first_without_college_label(self):
+        person_id = self.shortlist_profile("Role First", "role-first-123")
+        with connect(self.database_path) as connection:
+            connection.execute(
+                """UPDATE people SET headline = ?, snippet = ?, org_type = ?,
+                   org_name = ?, verified_status = ? WHERE id = ?""",
+                (
+                    "Video Editor | PSG iTech",
+                    "Video editing and motion graphics",
+                    "College",
+                    "PSG iTech",
+                    "current",
+                    person_id,
+                ),
+            )
+            connection.execute(
+                """INSERT INTO messages
+                   (person_id, channel, draft_text, is_edited)
+                   VALUES (?, 'connection', 'Hello', 0)""",
+                (person_id,),
+            )
+        response = self.client.get(self.today_shortlist_url())
+        self.assertEqual(response.status_code, 200)
+        self.assertIn(b'data-role="Video Editor"', response.data)
+        self.assertIn(b'class="sl-role sl-role-video-editor"', response.data)
+        row_html = response.data.decode().split(
+            '<div class="shortlist-person-row sl-row"', 1
+        )[1].split('<div class="shortlist-expanded-panel"', 1)[0]
+        self.assertIn("Video Editor", row_html)
+        self.assertIn("✓", row_html)
+        self.assertNotIn("College", row_html)
+
+    def test_send_controls_open_platform_links_without_posting_or_changing_status(self):
+        instagram_id = self.shortlist_profile("Instagram Person", "instagram-person-123")
+        linkedin_id = self.shortlist_profile("LinkedIn Person", "linkedin-person-123")
+        with connect(self.database_path) as connection:
+            connection.execute(
+                "UPDATE people SET instagram_handle = ? WHERE id = ?",
+                ("jane.editor", instagram_id),
+            )
+            for person_id in (instagram_id, linkedin_id):
+                connection.execute(
+                    """INSERT INTO messages
+                       (person_id, channel, draft_text, is_edited)
+                       VALUES (?, 'connection', 'Hello there', 0)""",
+                    (person_id,),
+                )
+        response = self.client.get(self.today_shortlist_url())
+        self.assertEqual(response.status_code, 200)
+        html = response.data.decode()
+        self.assertIn('data-send-target="https://ig.me/m/jane.editor"', html)
+        self.assertIn(
+            'data-send-target="https://www.linkedin.com/in/linkedin-person-123"',
+            html,
+        )
+        self.assertIn("Send · IG", html)
+        self.assertIn("Send · LinkedIn", html)
+        self.assertIn("Open LinkedIn profile", html)
+        self.assertIn("Open Instagram DM", html)
+        send_controls = re.findall(r"<button\b[^>]*data-send-open[^>]*>", html)
+        self.assertTrue(send_controls)
+        self.assertTrue(all('type="button"' in control for control in send_controls))
+        self.assertTrue(all("form=" not in control for control in send_controls))
+        with connect(self.database_path) as connection:
+            statuses = connection.execute(
+                "SELECT status FROM people WHERE id IN (?, ?)",
+                (instagram_id, linkedin_id),
+            ).fetchall()
+        self.assertEqual({row["status"] for row in statuses}, {"shortlisted"})
+
+    def test_shortlist_date_survives_actions_and_scopes_generate_all(self):
+        selected_id = self.shortlist_profile("Selected Day", "selected-day-123")
+        other_id = self.shortlist_profile("Other Day", "other-day-123")
+        with connect(self.database_path) as connection:
+            connection.execute(
+                "UPDATE people SET shortlisted_at = ? WHERE id = ?",
+                ("2026-11-03T10:15:00+05:30", selected_id),
+            )
+            connection.execute(
+                "UPDATE people SET shortlisted_at = ? WHERE id = ?",
+                ("2026-11-04T10:15:00+05:30", other_id),
+            )
+        date_value = "2026-11-03"
+        selected_page = self.client.get(f"/shortlist?date={date_value}")
+        self.assertIn(b'name="date" value="2026-11-03"', selected_page.data)
+        response = self.client.post(
+            "/shortlist/messages",
+            data={
+                "date": date_value,
+                "kind": "connection",
+                "action": "generate",
+                "common_message": "Hello {first_name}",
+                "apply_to": "all",
+            },
+        )
+        self.assertIn(f"date={date_value}", response.location)
+        with connect(self.database_path) as connection:
+            drafts = connection.execute(
+                "SELECT person_id FROM messages WHERE channel = 'connection'"
+            ).fetchall()
+        self.assertEqual([row["person_id"] for row in drafts], [selected_id])
+
+        save_response = self.client.post(
+            f"/people/{selected_id}/save",
+            data={
+                "date": date_value,
+                "personal_note": "A detail",
+                "verified_status": "unverified",
+                "verified_note": "",
+                "instagram_handle": "",
+            },
+        )
+        self.assertIn(f"date={date_value}", save_response.location)
+        sent_response = self.client.post(
+            f"/people/{selected_id}/sent",
+            data={
+                "date": date_value,
+                "kind": "connection",
+                "sent_text": "Manual send",
+            },
+        )
+        self.assertIn(f"date={date_value}", sent_response.location)
+        remove_response = self.client.post(
+            f"/people/{selected_id}/remove", data={"date": date_value}
+        )
+        self.assertIn(f"date={date_value}", remove_response.location)
+
     def test_remove_from_shortlist_keeps_tracker_history(self):
         profile = {"name": "Keep history", "url": "https://www.linkedin.com/in/keep-history-123"}
         self.client.post("/shortlist", data={"profile": json.dumps(profile)})
@@ -670,7 +856,7 @@ class EditorScoutTests(unittest.TestCase):
             ).fetchone()["id"]
         response = self.client.post(f"/people/{person_id}/remove")
         self.assertEqual(response.status_code, 302)
-        self.assertNotIn(b"Keep history", self.client.get("/shortlist").data)
+        self.assertNotIn(b"Keep history", self.client.get(self.today_shortlist_url()).data)
         tracker = self.client.get("/tracker")
         self.assertIn(b"Keep history", tracker.data)
         self.assertIn(b"Removed from shortlist", tracker.data)
@@ -1051,7 +1237,7 @@ class EditorScoutTests(unittest.TestCase):
         self.assertEqual(instagram["handle"], "jane.editor")
         self.assertEqual(youtube["dismissed"], 1)
         self.assertEqual(youtube["confirmed"], 0)
-        shortlist = self.client.get("/shortlist")
+        shortlist = self.client.get(self.today_shortlist_url())
         self.assertIn(b"Open Instagram DM", shortlist.data)
         self.assertIn(b"ig.me/m/jane.editor", shortlist.data)
 
@@ -1175,7 +1361,7 @@ class EditorScoutTests(unittest.TestCase):
                 ).fetchone()["value"],
                 "Thanks {first_name}",
             )
-        page = self.client.get("/shortlist")
+        page = self.client.get(self.today_shortlist_url())
         self.assertIn(b"data-connection=", page.data)
         self.assertIn(b"Only the people I tick", page.data)
         self.assertIn(b"This only prepares text and links", page.data)
@@ -1254,7 +1440,7 @@ class EditorScoutTests(unittest.TestCase):
             ).fetchone()
         self.assertEqual(draft["draft_text"], "Common for Edited")
         self.assertEqual(draft["is_edited"], 0)
-        self.assertIn(b"Edited", self.client.get("/shortlist").data)
+        self.assertIn(b"Edited", self.client.get(self.today_shortlist_url()).data)
 
     def test_generation_skips_contacted_people_and_enforces_followup_status(self):
         sent_id = self.shortlist_profile("Sent Person", "sent-person-123", "sent")
@@ -1363,7 +1549,7 @@ class EditorScoutTests(unittest.TestCase):
         self.assertEqual(history["old_status"], "shortlisted")
         self.assertEqual(history["new_status"], "sent")
         self.assertEqual(history["changed_at"], person["sent_at"])
-        self.assertIn(b"of 10 sent today", self.client.get("/shortlist").data)
+        self.assertIn(b"of 10 sent today", self.client.get(self.today_shortlist_url()).data)
 
     def test_marking_same_kind_sent_requires_confirmation(self):
         person_id = self.shortlist_profile("Duplicate Send", "duplicate-send-123")

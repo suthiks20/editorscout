@@ -1,16 +1,47 @@
 {% extends "base.html" %}
 {% block title %}Shortlist · EditorScout{% endblock %}
 {% block content %}
+{% macro shortlist_date_input() -%}
+  <input type="hidden" name="date" value="{{ selected_date or '' }}">
+{%- endmacro %}
 <section class="page-heading">
   <p class="eyebrow">YOUR PICKS</p>
   <h1>Shortlist</h1>
   <p>Prepare your message here. Copy it, send it yourself, then mark it as sent.</p>
-  <p class="muted">{% if batch %}Current batch: <strong>{{ batch.name }}</strong>{% else %}No current batch yet{% endif %} · {{ person_count }} profile(s)</p>
+  <p class="muted">{% if batch %}Current batch: <strong>{{ batch.name }}</strong>{% else %}No current batch yet{% endif %}</p>
+  <p class="muted"><strong>{{ total_shortlisted }} shortlisted in total</strong>{% if selected_date %} · showing {{ person_count }} on {{ selected_date_label }}{% endif %}</p>
   <form method="post" action="{{ url_for('start_new_batch') }}" data-confirm="Start a new shortlist batch? Existing outreach will remain in the tracker.">
+    {{ shortlist_date_input() }}
     <button class="button button-secondary" type="submit">Start new batch</button>
   </form>
 </section>
 
+{% if not selected_date %}
+  <section class="date-log">
+    <h2>Pick a date</h2>
+    {% if date_log %}
+      <div class="date-groups">
+        {% for group in date_log %}
+          <article class="date-group">
+            <a class="date-link" href="{{ url_for('shortlist_page', date=group.date) }}">{{ group.label }}</a>
+            <p>{{ group.count }} shortlisted · {{ group.sent }} contacted</p>
+            <details class="time-log">
+              <summary>Time log</summary>
+              <ul>
+                {% for entry in group.entries %}
+                  <li><span class="time-chip">{{ entry.time }}</span> {{ entry.name }} <span class="status-pill status-{{ entry.status }}">{{ entry.status|title }}</span></li>
+                {% endfor %}
+              </ul>
+            </details>
+          </article>
+        {% endfor %}
+      </div>
+    {% else %}
+      <p class="empty-state">Nobody has been shortlisted yet.</p>
+    {% endif %}
+  </section>
+{% else %}
+  <p><a class="button button-secondary" href="{{ url_for('shortlist_page') }}">All dates</a></p>
 <div class="daily-count {% if sent_today > warning_threshold %}daily-count-warning{% endif %}">
   <span class="count-number">{{ sent_today }}</span>
   <span>of 10 sent today</span>
@@ -20,6 +51,7 @@
 <section class="panel common-message-panel">
   <h2>Common message</h2>
   <form id="common-message-form" method="post" action="{{ url_for('shortlist_messages') }}">
+    {{ shortlist_date_input() }}
     <label>Kind
       <select id="common-kind" name="kind">
         <option value="connection">Connection note</option>
@@ -68,33 +100,125 @@
 </section>
 
 {% if people %}
-  <div class="selection-controls">
-    <strong>Select people</strong>
-    <button type="button" class="button button-secondary" data-select-people="all">Select all</button>
-    <button type="button" class="button button-secondary" data-select-people="none">Select none</button>
-    <label class="checkbox-label queue-mode-toggle"><input type="checkbox" id="queue-mode"> Queue mode</label>
-  </div>
-  <div class="queue-controls" id="queue-controls" hidden>
-    <span id="queue-position">Queue</span>
-    <button type="button" class="button button-secondary" id="queue-next">Next</button>
-  </div>
+  {% set contacted_count = people|selectattr('status', 'ne', 'shortlisted')|list|length %}
+  {% set sent_count = namespace(total=0) %}
+  {% for person in people %}
+    {% if person.status in ('sent', 'connected', 'replied', 'agreed') %}{% set sent_count.total = sent_count.total + 1 %}{% endif %}
+  {% endfor %}
+  <section class="shortlist-toolbar" aria-label="Shortlist controls">
+    <div class="shortlist-progress">
+      <strong>{{ contacted_count }} of {{ person_count }} sent</strong>
+      <div class="progress-track" role="progressbar" aria-label="Shortlist progress" aria-valuemin="0" aria-valuemax="{{ person_count }}" aria-valuenow="{{ contacted_count }}">
+        <span style="width: {{ (contacted_count * 100 / person_count) if person_count else 0 }}%"></span>
+      </div>
+    </div>
+    <div class="shortlist-toolbar-controls">
+      <div class="shortlist-filters" role="group" aria-label="Filter people">
+        <button type="button" class="filter-chip" data-shortlist-filter="all" aria-pressed="true">All <span data-filter-count="all">{{ person_count }}</span></button>
+        <button type="button" class="filter-chip" data-shortlist-filter="needs-draft" aria-pressed="false">Needs draft <span data-filter-count="needs-draft">0</span></button>
+        <button type="button" class="filter-chip" data-shortlist-filter="ready" aria-pressed="false">Ready to send <span data-filter-count="ready">0</span></button>
+        <button type="button" class="filter-chip" data-shortlist-filter="sent" aria-pressed="false">Sent <span data-filter-count="sent">{{ sent_count.total }}</span></button>
+      </div>
+      <div class="shortlist-filters" role="group" aria-label="Filter by creative role">
+        <button type="button" class="filter-chip" data-role-filter="all" aria-pressed="true">All roles <span data-role-count="all">{{ person_count }}</span></button>
+        <button type="button" class="filter-chip" data-role-filter="Content Creator" aria-pressed="false">Content Creator <span data-role-count="Content Creator">0</span></button>
+        <button type="button" class="filter-chip" data-role-filter="Video Editor" aria-pressed="false">Video Editor <span data-role-count="Video Editor">0</span></button>
+        <button type="button" class="filter-chip" data-role-filter="Videographer" aria-pressed="false">Videographer <span data-role-count="Videographer">0</span></button>
+        <button type="button" class="filter-chip" data-role-filter="Other" aria-pressed="false">Other <span data-role-count="Other">0</span></button>
+      </div>
+      <label class="shortlist-search">Search
+        <input type="search" id="shortlist-search" placeholder="Name or organisation" autocomplete="off">
+      </label>
+      <label class="checkbox-label creators-first-toggle"><input type="checkbox" id="creators-first"> Creators first</label>
+      <div class="selection-controls">
+        <button type="button" class="button button-secondary" data-select-people="all">Select all visible</button>
+        <button type="button" class="button button-secondary" data-select-people="none">Select none</button>
+        <label class="checkbox-label queue-mode-toggle"><input type="checkbox" id="queue-mode"> Queue mode</label>
+        <button type="button" class="button button-secondary" id="collapse-all">Collapse all</button>
+      </div>
+    </div>
+    <div class="queue-controls" id="queue-controls" hidden>
+      <button type="button" class="button button-secondary" id="queue-previous">Previous</button>
+      <span id="queue-position" aria-live="polite">Queue</span>
+      <button type="button" class="button button-secondary" id="queue-next">Next</button>
+    </div>
+    <p class="shortlist-keyboard-hint">Shortcuts: J/K next/previous · Enter expand/collapse · C copy · O send/open · S mark sent</p>
+  </section>
+  <p class="sl-send-note">Send copies your message and opens their profile. You paste and send it yourself, then press Mark sent.</p>
+  <p class="sl-send-toast" id="sl-send-toast" role="status" aria-live="polite" hidden></p>
   <div class="card-list" id="shortlist-cards">
     {% for person in people %}
-      <article class="person-card shortlist-person-card" data-queue-card data-person-id="{{ person.id }}">
-        <label class="checkbox-label person-select">
-          <input class="shortlist-person-checkbox" type="checkbox" name="person_ids" value="{{ person.id }}" form="common-message-form">
-          Include in selection
-        </label>
-        <div class="person-card-heading">
-          <div>
-            <a class="profile-name" href="{{ person.url }}" target="_blank" rel="noopener noreferrer">Open LinkedIn profile · {{ person.name }}</a>
-            {% if person.headline %}<p class="profile-headline">{{ person.headline }}</p>{% endif %}
+      {% set connection_draft = person.drafts.get('connection') %}
+      {% set connection_text = connection_draft.draft_text if connection_draft else '' %}
+      {% set role_label, cleaned_headline = detect_role(person.headline, person.snippet, person.org_name) %}
+      {% set send_handle = normalize_manual_instagram_handle(person.instagram_handle) %}
+      {% set send_url = 'https://ig.me/m/' ~ send_handle if send_handle else person.url %}
+      {% set role_key = role_label %}
+      <article class="person-card shortlist-person-card" data-queue-card data-person-id="{{ person.id }}"
+        data-status="{{ person.status }}" data-name="{{ person.name|lower }}" data-organisation="{{ person.org_name|lower }}"
+        data-role="{{ role_label }}" data-headline="{{ cleaned_headline|lower }}"
+        data-has-draft="{{ 'true' if connection_draft else 'false' }}"
+        data-needs-sending="{{ 'true' if person.status == 'shortlisted' else 'false' }}">
+        <div class="shortlist-person-row sl-row" data-role="{{ role_label }}">
+          <label class="checkbox-label person-select" aria-label="Select {{ person.name }}">
+            <input class="shortlist-person-checkbox" type="checkbox" name="person_ids" value="{{ person.id }}" form="common-message-form">
+          </label>
+          <a class="shortlist-row-name" href="{{ person.url }}" target="_blank" rel="noopener noreferrer" title="Open LinkedIn profile">{{ person.name }}</a>
+          <span class="sl-role sl-role-{{ role_key|lower|replace(' ', '-') }}">
+            {{ role_label }}
+            <span class="sl-role-help" title="Guessed from the search snippet. Verify on their profile." aria-label="Guessed from the search snippet. Verify on their profile.">?</span>
+            {% if person.verified_status in ('current', 'past') %}<span class="sl-role-verified" title="Manually verified">✓</span>{% endif %}
+          </span>
+          <div class="shortlist-row-meta">
+            <span class="shortlist-row-headline" title="{{ cleaned_headline }}">{{ cleaned_headline }}</span>
+            {% if person.org_name %}<span class="sl-college" title="{{ person.org_name }}">{{ person.org_name }}</span>{% endif %}
           </div>
-          {% if person.org_name %}<span class="tag">{{ person.org_name }}</span><span class="muted small">{{ person.org_type|title }}</span>{% endif %}
+          <span class="status-pill status-{{ person.status }}">{{ person.status|replace('_', ' ')|title }}</span>
+          {% if connection_draft and connection_draft.is_edited %}
+            <span class="draft-state draft-state-edited">Edited</span>
+          {% elif connection_draft %}
+            <span class="draft-state draft-state-ready">Draft ready</span>
+          {% else %}
+            <span class="draft-state draft-state-empty">No draft</span>
+          {% endif %}
+          <div class="shortlist-row-actions">
+            <button type="button" class="button button-secondary compact-copy" data-copy-target="draft-{{ person.id }}-connection"
+              data-copy-compact {% if not connection_draft or connection_text|length > 299 %}disabled{% endif %}
+              title="{% if not connection_draft %}Generate a draft first{% elif connection_text|length > 299 %}Expand and choose Copy anyway to copy this draft{% else %}Copy connection draft{% endif %}">Copy</button>
+            {% if send_handle %}
+              <div class="sl-split">
+                <button type="button" class="button button-primary sl-send" data-send-open data-send-target="{{ send_url }}"
+                  data-send-draft="draft-{{ person.id }}-connection" data-send-compact
+                  {% if not connection_draft %}disabled title="Generate a draft first"{% endif %}>Send · IG</button>
+                <details class="sl-split-menu">
+                  <summary aria-label="Choose profile to open">⌄</summary>
+                  <div class="sl-split-options">
+                    <button type="button" data-send-open data-send-target="{{ person.url }}" data-send-draft="draft-{{ person.id }}-connection" {% if not connection_draft %}disabled{% endif %}>Open LinkedIn profile</button>
+                    <button type="button" data-send-open data-send-target="{{ send_url }}" data-send-draft="draft-{{ person.id }}-connection" {% if not connection_draft %}disabled{% endif %}>Open Instagram DM</button>
+                  </div>
+                </details>
+              </div>
+            {% else %}
+              <button type="button" class="button button-primary sl-send" data-send-open data-send-target="{{ person.url }}"
+                data-send-draft="draft-{{ person.id }}-connection" data-send-compact
+                {% if not connection_draft %}disabled title="Generate a draft first"{% endif %}>Send · LinkedIn</button>
+            {% endif %}
+            <button type="submit" class="button button-secondary compact-send" form="mark-sent-{{ person.id }}-connection"
+              data-quick-send {% if not connection_draft %}disabled title="Generate a draft first"{% endif %}>Mark sent</button>
+            <button type="button" class="expand-person" data-person-toggle aria-expanded="false"
+              aria-controls="person-panel-{{ person.id }}" aria-label="Expand {{ person.name }}">⌄</button>
+          </div>
         </div>
-        {% if person.snippet %}<p class="profile-snippet">{{ person.snippet }}</p>{% endif %}
+        <div class="shortlist-expanded-panel" id="person-panel-{{ person.id }}" hidden>
         {% if person.status in ('sent', 'connected', 'replied', 'agreed') %}<p class="warning-banner">This person is marked {{ person.status }}. Connection drafts are skipped unless you choose to include contacted people.</p>{% endif %}
         {% if not person.personal_note and ('{specific_note}' in common_messages.connection or '{specific_note}' in common_messages.follow_up) %}<p class="muted small">A placeholder is empty; it will be omitted from generated text.</p>{% endif %}
+        <div class="person-tabs" role="tablist" aria-label="Details for {{ person.name }}">
+          <button type="button" role="tab" id="tab-{{ person.id }}-draft" aria-controls="tabpanel-{{ person.id }}-draft" aria-selected="true" tabindex="0" data-person-tab="draft">Draft</button>
+          <button type="button" role="tab" id="tab-{{ person.id }}-details" aria-controls="tabpanel-{{ person.id }}-details" aria-selected="false" tabindex="-1" data-person-tab="details">Details</button>
+          <button type="button" role="tab" id="tab-{{ person.id }}-links" aria-controls="tabpanel-{{ person.id }}-links" aria-selected="false" tabindex="-1" data-person-tab="links">Links</button>
+          <button type="button" role="tab" id="tab-{{ person.id }}-follow-up" aria-controls="tabpanel-{{ person.id }}-follow-up" aria-selected="false" tabindex="-1" data-person-tab="follow-up">Follow-up</button>
+        </div>
+        <section id="tabpanel-{{ person.id }}-links" role="tabpanel" aria-labelledby="tab-{{ person.id }}-links" data-person-tabpanel="links" hidden>
         <div class="confirmed-links">
           {% for link in person_links_by_person.get(person.id, []) %}
             {% if link.confirmed %}
@@ -107,6 +231,7 @@
         </div>
         <div class="find-links-actions">
           <form method="post" action="{{ url_for('find_more_links', person_id=person.id) }}">
+            {{ shortlist_date_input() }}
             <button class="button button-secondary" type="submit">Find more links</button>
             <button class="button button-secondary" type="submit" name="refresh" value="1">Refresh suggestions</button>
           </form>
@@ -126,9 +251,11 @@
                   <div class="draft-actions">
                     <a class="button button-secondary" href="{{ link.url }}" target="_blank" rel="noopener noreferrer">Open link</a>
                     <form method="post" action="{{ url_for('confirm_person_link', person_id=person.id, link_id=link.id) }}">
+                      {{ shortlist_date_input() }}
                       <button class="button button-primary" type="submit">This is them</button>
                     </form>
                     <form method="post" action="{{ url_for('dismiss_person_link', person_id=person.id, link_id=link.id) }}">
+                      {{ shortlist_date_input() }}
                       <button class="button button-secondary" type="submit">Not them</button>
                     </form>
                   </div>
@@ -137,7 +264,12 @@
             {% endfor %}
           </div>
         {% endif %}
+        </section>
+        <section id="tabpanel-{{ person.id }}-details" role="tabpanel" aria-labelledby="tab-{{ person.id }}-details" data-person-tabpanel="details" hidden>
+          {% if person.headline %}<p class="profile-headline"><strong>Original headline:</strong> {{ person.headline }}</p>{% endif %}
+          {% if person.snippet %}<p class="profile-snippet">{{ person.snippet }}</p>{% endif %}
         <form class="note-form" method="post" action="{{ url_for('save_person', person_id=person.id) }}">
+          {{ shortlist_date_input() }}
           <label>One specific thing I liked about their work
             <textarea name="personal_note" maxlength="1000" placeholder="For example: the pacing and color work in their Coimbatore food reel">{{ person.personal_note }}</textarea>
           </label>
@@ -157,56 +289,101 @@
           </label>
           <button class="button button-secondary" type="submit">Save notes and verification</button>
         </form>
-
-        {% for kind, label in (("connection", "Connection note"), ("follow_up", "Follow-up")) %}
-          {% set draft = person.drafts.get(kind) %}
+        </section>
+        {% set draft = person.drafts.get('connection') %}
+        <section id="tabpanel-{{ person.id }}-draft" role="tabpanel" aria-labelledby="tab-{{ person.id }}-draft" data-person-tabpanel="draft">
           <section class="person-draft">
             <div class="person-draft-heading">
-              <h3>{{ label }}</h3>
+              <h3>Connection note</h3>
               {% if draft and draft.is_edited %}<span class="edited-badge">Edited</span>{% endif %}
             </div>
-            {% if kind == 'follow_up' and person.status not in ('connected', 'replied', 'agreed') %}
-              <p class="muted small">Follow-up drafts are available after the status is connected, replied, or agreed.</p>
-            {% endif %}
-            <form method="post" action="{{ url_for('save_draft', person_id=person.id) }}" id="draft-form-{{ person.id }}-{{ kind }}">
-              <input type="hidden" name="channel" value="{{ kind }}">
-              <label class="visually-hidden" for="draft-{{ person.id }}-{{ kind }}">{{ label }} message to send</label>
-              <textarea id="draft-{{ person.id }}-{{ kind }}" name="draft_text" maxlength="5000" rows="4" data-char-count data-count-limit="{% if kind == 'connection' %}299{% else %}3000{% endif %}">{{ draft.draft_text if draft else '' }}</textarea>
+            <form method="post" action="{{ url_for('save_draft', person_id=person.id) }}" id="draft-form-{{ person.id }}-connection">
+              {{ shortlist_date_input() }}
+              <input type="hidden" name="channel" value="connection">
+              <label class="visually-hidden" for="draft-{{ person.id }}-connection">Connection note message to send</label>
+              <textarea id="draft-{{ person.id }}-connection" name="draft_text" maxlength="5000" rows="3" data-char-count data-count-limit="299">{{ draft.draft_text if draft else '' }}</textarea>
               <div class="draft-controls">
-                <span class="muted"><span data-count-for="draft-{{ person.id }}-{{ kind }}">{{ draft.draft_text|length if draft else 0 }}</span> / {% if kind == 'connection' %}299{% else %}3000{% endif %}{% if kind == 'follow_up' %} soft{% endif %} characters</span>
-                <button class="button button-secondary" type="button" data-copy-target="draft-{{ person.id }}-{{ kind }}" {% if kind == 'connection' and draft and draft.draft_text|length > 299 %}disabled{% endif %}>Copy</button>
-                {% if kind == 'connection' %}
-                  <label class="checkbox-label copy-anyway"><input type="checkbox" data-copy-anyway="draft-{{ person.id }}-{{ kind }}"> Copy anyway</label>
-                {% endif %}
+                <span class="muted"><span data-count-for="draft-{{ person.id }}-connection">{{ draft.draft_text|length if draft else 0 }}</span> / 299 characters</span>
+                <button class="button button-secondary" type="button" data-copy-target="draft-{{ person.id }}-connection" {% if draft and draft.draft_text|length > 299 %}disabled{% endif %}>Copy</button>
+                <label class="checkbox-label copy-anyway"><input type="checkbox" data-copy-anyway="draft-{{ person.id }}-connection"> Copy anyway</label>
                 <button class="button button-primary" type="submit">Save edit</button>
               </div>
-              {% if kind == 'connection' %}<p class="warning-banner" data-over-limit-for="draft-{{ person.id }}-{{ kind }}" {% if not draft or draft.draft_text|length <= 299 %}hidden{% endif %}>This connection note exceeds 299 characters. Shorten it or select “Copy anyway”.</p>{% endif %}
+              <p class="warning-banner" data-over-limit-for="draft-{{ person.id }}-connection" {% if not draft or draft.draft_text|length <= 299 %}hidden{% endif %}>This connection note exceeds 299 characters. Shorten it or select “Copy anyway”.</p>
             </form>
             <form method="post" action="{{ url_for('reset_shortlist_draft', person_id=person.id) }}">
-              <input type="hidden" name="kind" value="{{ kind }}">
+              {{ shortlist_date_input() }}
+              <input type="hidden" name="kind" value="connection">
               <button class="button button-secondary" type="submit">Reset to common message</button>
             </form>
-            <form class="mark-sent-form" method="post" action="{{ url_for('mark_message_sent', person_id=person.id) }}"
-              data-send-from="draft-{{ person.id }}-{{ kind }}">
-              <input type="hidden" name="kind" value="{{ kind }}">
-              <input type="hidden" name="sent_text" value="">
-              <label>Follow-up date
-                <input type="date" name="follow_up_date" value="{{ person.follow_up_date or default_follow_up_date }}">
-              </label>
-              {% if person.sent_kinds.get(kind) %}
-                <label class="checkbox-label"><input type="checkbox" name="confirm_duplicate" value="1" required> This kind of message was already sent; confirm this new send</label>
-              {% endif %}
-              <button class="button button-secondary" type="submit">Mark as sent</button>
-            </form>
           </section>
-        {% endfor %}
-        <form method="post" action="{{ url_for('remove_from_shortlist', person_id=person.id) }}">
-          <button class="button button-secondary" type="submit">Remove from shortlist</button>
-        </form>
+        </section>
+        <section id="tabpanel-{{ person.id }}-follow-up" role="tabpanel" aria-labelledby="tab-{{ person.id }}-follow-up" data-person-tabpanel="follow-up" hidden>
+          {% if person.status in ('connected', 'replied', 'agreed') %}
+            {% set draft = person.drafts.get('follow_up') %}
+            <section class="person-draft">
+              <div class="person-draft-heading">
+                <h3>Follow-up</h3>
+                {% if draft and draft.is_edited %}<span class="edited-badge">Edited</span>{% endif %}
+              </div>
+              <form method="post" action="{{ url_for('save_draft', person_id=person.id) }}" id="draft-form-{{ person.id }}-follow_up">
+                {{ shortlist_date_input() }}
+                <input type="hidden" name="channel" value="follow_up">
+                <label class="visually-hidden" for="draft-{{ person.id }}-follow_up">Follow-up message to send</label>
+                <textarea id="draft-{{ person.id }}-follow_up" name="draft_text" maxlength="5000" rows="3" data-char-count data-count-limit="3000">{{ draft.draft_text if draft else '' }}</textarea>
+                <div class="draft-controls">
+                  <span class="muted"><span data-count-for="draft-{{ person.id }}-follow_up">{{ draft.draft_text|length if draft else 0 }}</span> / 3000 soft characters</span>
+                  <button class="button button-secondary" type="button" data-copy-target="draft-{{ person.id }}-follow_up">Copy</button>
+                  <button class="button button-primary" type="submit">Save edit</button>
+                </div>
+              </form>
+              <form method="post" action="{{ url_for('reset_shortlist_draft', person_id=person.id) }}">
+                {{ shortlist_date_input() }}
+                <input type="hidden" name="kind" value="follow_up">
+                <button class="button button-secondary" type="submit">Reset to common message</button>
+              </form>
+              <form class="mark-sent-form" method="post" action="{{ url_for('mark_message_sent', person_id=person.id) }}"
+                data-send-from="draft-{{ person.id }}-follow_up">
+                {{ shortlist_date_input() }}
+                <input type="hidden" name="kind" value="follow_up">
+                <input type="hidden" name="sent_text" value="">
+                <label>Follow-up date
+                  <input type="date" name="follow_up_date" value="{{ person.follow_up_date or default_follow_up_date }}">
+                </label>
+                {% if person.sent_kinds.get('follow_up') %}
+                  <label class="checkbox-label"><input type="checkbox" name="confirm_duplicate" value="1" required> This kind of message was already sent; confirm this new send</label>
+                {% endif %}
+                <button class="button button-secondary" type="submit">Mark as sent</button>
+              </form>
+            </section>
+          {% else %}
+            <p class="muted small">Follow-up drafts are available after the status is connected, replied, or agreed.</p>
+          {% endif %}
+        </section>
+        <footer class="shortlist-card-footer">
+          <form class="mark-sent-form" method="post" action="{{ url_for('mark_message_sent', person_id=person.id) }}"
+            id="mark-sent-{{ person.id }}-connection" data-send-from="draft-{{ person.id }}-connection">
+            {{ shortlist_date_input() }}
+            <input type="hidden" name="kind" value="connection">
+            <input type="hidden" name="sent_text" value="">
+            <label>Follow-up date
+              <input type="date" name="follow_up_date" value="{{ person.follow_up_date or default_follow_up_date }}">
+            </label>
+            {% if person.sent_kinds.get('connection') %}
+              <label class="checkbox-label"><input type="checkbox" name="confirm_duplicate" value="1" required> This kind of message was already sent; confirm this new send</label>
+            {% endif %}
+            <button class="button button-primary" type="submit" {% if not connection_draft %}disabled title="Generate a draft first"{% endif %}>Mark connection as sent</button>
+          </form>
+          <form method="post" action="{{ url_for('remove_from_shortlist', person_id=person.id) }}">
+            {{ shortlist_date_input() }}
+            <button class="button button-secondary" type="submit">Remove from shortlist</button>
+          </form>
+        </footer>
+        </div>
       </article>
     {% endfor %}
   </div>
 {% else %}
-  <div class="empty-state"><strong>Your shortlist is empty.</strong><p>Search for creators and add profiles you want to review.</p><a class="button button-primary" href="{{ url_for('search_page') }}">Find creators</a></div>
+  <div class="empty-state"><strong>Nobody shortlisted on {{ selected_date_label }}</strong><p>Choose another date or add profiles from Discover.</p><a class="button button-primary" href="{{ url_for('search_page') }}">Find creators</a></div>
+{% endif %}
 {% endif %}
 {% endblock %}
