@@ -22,8 +22,17 @@ OUTREACH_COLUMNS = (
     ("Created", "created_at"),
     ("Updated", "updated_at"),
     ("Batch", "batch_name"),
+    ("Instagram handle", "instagram_handle"),
+    ("Confirmed Instagram link", "confirmed_instagram_link"),
+    ("Confirmed YouTube link", "confirmed_youtube_link"),
+    ("Source", "source"),
+    ("Referred by", "referred_by"),
+    ("Touch count", "touch_count"),
+    ("Follow-up date", "follow_up_date"),
+    ("Sent at", "sent_at"),
+    ("Last sent message", "last_sent_text"),
 )
-OUTREACH_STATUSES = ("new", "shortlisted", "sent", "replied", "agreed", "rejected")
+OUTREACH_STATUSES = ("new", "shortlisted", "sent", "connected", "replied", "agreed", "rejected")
 VERIFIED_STATUSES = ("unverified", "current", "past", "unsure")
 FORMULA_PREFIXES = ("=", "+", "-", "@")
 
@@ -47,6 +56,15 @@ def parse_datetime(value):
         return escape_excel_value(str(value))
 
 
+def parse_date(value):
+    if not value:
+        return None
+    try:
+        return datetime.strptime(str(value), "%Y-%m-%d").date()
+    except ValueError:
+        return escape_excel_value(str(value))
+
+
 def build_workbook(people, export_date=None):
     workbook = Workbook()
     outreach = workbook.active
@@ -58,14 +76,16 @@ def build_workbook(people, export_date=None):
         cell.fill = header_fill
         cell.alignment = Alignment(vertical="center", wrap_text=True)
     outreach.freeze_panes = "A2"
-    outreach.auto_filter.ref = f"A1:O{max(1, len(people) + 1)}"
+    outreach.auto_filter.ref = f"A1:X{max(1, len(people) + 1)}"
 
     for person in people:
         row_values = []
         for header, field in OUTREACH_COLUMNS:
             value = person[field]
-            if field in ("created_at", "updated_at"):
+            if field in ("created_at", "updated_at", "sent_at"):
                 value = parse_datetime(value)
+            elif field == "follow_up_date":
+                value = parse_date(value)
             else:
                 value = escape_excel_value(value)
             row_values.append(value)
@@ -77,11 +97,11 @@ def build_workbook(people, export_date=None):
         ):
             url_cell.hyperlink = person["url"]
             url_cell.style = "Hyperlink"
-        for column in (9, 11, 12):
+        for column in (9, 11, 12, 24):
             outreach.cell(row=row_number, column=column).alignment = Alignment(
                 vertical="top", wrap_text=True
             )
-        for column in (13, 14):
+        for column in (13, 14, 23):
             cell = outreach.cell(row=row_number, column=column)
             if isinstance(cell.value, datetime):
                 cell.number_format = "yyyy-mm-dd hh:mm"
@@ -89,7 +109,8 @@ def build_workbook(people, export_date=None):
     widths = {
         "A": 24, "B": 32, "C": 42, "D": 18, "E": 30, "F": 16, "G": 18,
         "H": 18, "I": 38, "J": 20, "K": 38, "L": 48, "M": 20, "N": 20,
-        "O": 28,
+        "O": 28, "P": 22, "Q": 42, "R": 42, "S": 18, "T": 24, "U": 14,
+        "V": 18, "W": 20, "X": 48,
     }
     for column, width in widths.items():
         outreach.column_dimensions[column].width = width

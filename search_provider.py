@@ -33,7 +33,7 @@ def search_web(query, num=10, page=1):
                 "X-API-KEY": Config.SERPER_API_KEY,
                 "Content-Type": "application/json",
             },
-            json={"q": query, "num": num, "page": page, "gl": "in"},
+            json={"q": query, "num": max(1, min(int(num), 10)), "page": page, "gl": "in"},
             timeout=Config.SERPER_TIMEOUT_SECONDS,
         )
     except requests.Timeout as exc:
@@ -66,3 +66,52 @@ def search_web(query, num=10, page=1):
             }
         )
     return results
+
+
+def search_videos(query, num=10):
+    """Return Serper video results with a consistent title/link/snippet shape."""
+    if not Config.SERPER_API_KEY:
+        raise RuntimeError("Add SERPER_API_KEY to your .env file to search.")
+
+    try:
+        response = requests.post(
+            Config.SERPER_URL.rsplit("/", 1)[0] + "/videos",
+            headers={
+                "X-API-KEY": Config.SERPER_API_KEY,
+                "Content-Type": "application/json",
+            },
+            json={"q": query, "num": max(1, min(int(num), 10)), "gl": "in"},
+            timeout=Config.SERPER_TIMEOUT_SECONDS,
+        )
+    except requests.Timeout as exc:
+        raise SearchTimeoutError("Serper video search timed out.") from exc
+    except requests.ConnectionError as exc:
+        raise SearchConnectionError("Could not connect to Serper video search.") from exc
+    except requests.RequestException as exc:
+        raise SearchConnectionError("Could not connect to Serper video search.") from exc
+
+    if not response.ok:
+        raise SearchAPIError(response.status_code)
+
+    try:
+        payload = response.json()
+    except (ValueError, requests.JSONDecodeError) as exc:
+        raise SearchResponseError("Serper returned an unreadable video response.") from exc
+
+    if not isinstance(payload, dict) or not isinstance(payload.get("videos"), list):
+        raise SearchResponseError("Serper returned an unreadable video response.")
+
+    results = []
+    for item in payload["videos"]:
+        if not isinstance(item, dict):
+            raise SearchResponseError("Serper returned an unreadable video response.")
+        results.append(
+            {
+                "title": item.get("title", ""),
+                "link": item.get("link", ""),
+                "snippet": item.get("snippet") or item.get("channel", ""),
+                "channel": item.get("channel", ""),
+                "date": item.get("date", ""),
+            }
+        )
+    return results[: max(1, min(int(num), 10))]

@@ -2,8 +2,10 @@ import json
 import sqlite3
 import tempfile
 import unittest
+from datetime import datetime, timedelta
 from io import BytesIO
 from pathlib import Path
+from zoneinfo import ZoneInfo
 from unittest.mock import patch
 
 from app import build_query, create_app, normalize_filters
@@ -33,6 +35,30 @@ class EditorScoutTests(unittest.TestCase):
 
     def tearDown(self):
         self.temp_dir.cleanup()
+
+    def shortlist_profile(self, name, slug, status=None):
+        response = self.client.post(
+            "/shortlist",
+            data={
+                "profile": json.dumps(
+                    {
+                        "name": name,
+                        "url": f"https://www.linkedin.com/in/{slug}",
+                    }
+                )
+            },
+        )
+        self.assertEqual(response.status_code, 302)
+        with connect(self.database_path) as connection:
+            row = connection.execute(
+                "SELECT id FROM people WHERE url = ?",
+                (f"https://www.linkedin.com/in/{slug}",),
+            ).fetchone()
+            if status:
+                connection.execute(
+                    "UPDATE people SET status = ? WHERE id = ?", (status, row["id"])
+                )
+        return row["id"]
 
     def test_primary_pages_render(self):
         for path in ("/", "/shortlist", "/tracker"):
@@ -319,6 +345,27 @@ class EditorScoutTests(unittest.TestCase):
             ).fetchone()[0]
         self.assertEqual(count, 1)
 
+    def test_empty_personal_note_does_not_block_connection_draft(self):
+        person_id = self.shortlist_profile("No Note Person", "no-note-person-123")
+        connection = self.client.post(
+            f"/people/{person_id}/draft", data={"channel": "connection"}
+        )
+        self.assertEqual(connection.status_code, 200)
+        self.assertIn(b"I&#39;d love to connect", connection.data)
+        self.assertNotIn(b"work on .", connection.data)
+        follow_up = self.client.post(
+            f"/people/{person_id}/draft", data={"channel": "follow_up"}
+        )
+        self.assertEqual(follow_up.status_code, 302)
+        self.client.post(
+            f"/people/{person_id}/update",
+            data={"status": "connected", "personal_note": ""},
+        )
+        follow_up = self.client.post(
+            f"/people/{person_id}/draft", data={"channel": "follow_up"}
+        )
+        self.assertEqual(follow_up.status_code, 200)
+
     def test_verified_status_is_saved_filtered_and_exported(self):
         profile = {
             "name": "A Person",
@@ -423,10 +470,14 @@ class EditorScoutTests(unittest.TestCase):
             "Created",
             "Updated",
             "Batch",
+            "Instagram handle",
+            "Confirmed Instagram link",
+            "Confirmed YouTube link",
         ]
-        self.assertEqual(
-            [cell.value for cell in outreach[1]], expected_headers
+        expected_headers.extend(
+            ["Source", "Referred by", "Touch count", "Follow-up date", "Sent at", "Last sent message"]
         )
+        self.assertEqual([cell.value for cell in outreach[1]], expected_headers)
         self.assertEqual(outreach.max_row, 2)
         self.assertEqual(outreach["A2"].value, "'=1+1")
         self.assertEqual(outreach["I2"].value, "'@verified note")
@@ -438,7 +489,7 @@ class EditorScoutTests(unittest.TestCase):
             "https://www.linkedin.com/in/excel-person",
         )
         self.assertTrue(outreach.freeze_panes == "A2")
-        self.assertTrue(outreach.auto_filter.ref.startswith("A1:O"))
+        self.assertTrue(outreach.auto_filter.ref.startswith("A1:X"))
         validations = list(outreach.data_validations.dataValidation)
         self.assertEqual(len(validations), 2)
         self.assertTrue(any("J2:J2" in validation.sqref for validation in validations))
@@ -451,6 +502,7 @@ class EditorScoutTests(unittest.TestCase):
             if isinstance(cell.value, str) and cell.value.startswith("=")
         ]
         self.assertTrue(any("COUNTIF(Outreach!J:J,\"sent\")" in f for f in formulas))
+        self.assertTrue(any("COUNTIF(Outreach!J:J,\"connected\")" in f for f in formulas))
         self.assertTrue(any("COUNTIF(Outreach!H:H,\"current\")" in f for f in formulas))
         self.assertEqual(sum(f.startswith("=IFERROR(") for f in formulas), 2)
         self.assertTrue(any("replied" in f and "sent" in f for f in formulas))
@@ -523,6 +575,7 @@ class EditorScoutTests(unittest.TestCase):
                 "years_text",
                 "verified_status",
                 "verified_note",
+                "instagram_handle",
             }.issubset(columns)
         )
         self.assertIsNotNone(person["batch_id"])
@@ -533,6 +586,11 @@ class EditorScoutTests(unittest.TestCase):
             ).fetchone()
         self.assertEqual(batch["name"], "Earlier outreach")
         self.assertEqual(batch["is_current"], 0)
+        with connect(legacy_path) as migrated:
+            self.assertEqual(
+                migrated.execute("SELECT COUNT(*) FROM person_links").fetchone()[0],
+                1,
+            )
 
     def test_tracker_warns_after_more_than_ten_are_marked_sent(self):
         with connect(self.database_path) as connection:
@@ -719,8 +777,8 @@ class EditorScoutTests(unittest.TestCase):
         self.assertIn(b'Jane &#34;J&#34; Doe', response.data)
         self.assertIn(b"Check the photo, name and organisation", response.data)
         mock_search.assert_called_once_with(
-            'site:linkedin.com/in "Jane \\"J\\" Doe" Coimbatore '
-            '"Acme Studio" Present',
+            'site:linkedin.com/in "Jane \\"J\\" Doe" "Acme Studio" '
+            '"Coimbatore" Present',
             num=10,
             page=1,
         )
@@ -845,6 +903,619 @@ class EditorScoutTests(unittest.TestCase):
         self.assertIn("Batch", headers)
         self.assertEqual(outreach.max_row, 2)
         self.assertEqual(outreach.cell(row=2, column=headers.index("Name") + 1).value, "Old batch")
+
+    def test_find_person_search_keeps_other_platform_results_when_one_fails(self):
+        from search_provider import SearchAPIError
+
+        def web_search(query, num, page):
+            if "site:instagram.com" in query:
+                raise SearchAPIError(429)
+            return [{
+                "title": "Jane Doe - Video Editor",
+                "link": "https://linkedin.com/in/jane-doe-123",
+                "snippet": "Jane Doe video editor",
+            }]
+
+        with patch("app.search_web", side_effect=web_search), patch(
+            "app.search_videos",
+            return_value=[{
+                "title": "Jane Doe editing",
+                "link": "https://youtube.com/watch?v=abc123",
+                "snippet": "Jane Doe's video channel",
+                "date": "2 days ago",
+            }],
+        ):
+            response = self.client.post(
+                "/search",
+                data={
+                    "mode": "person",
+                    "person_input": "Jane Doe",
+                    "role": "",
+                    "city": "",
+                    "filter_status": "any",
+                    "org_type": "",
+                    "org_name": "",
+                    "exclude_words": "",
+                    "platforms_enabled": "1",
+                    "platforms": ["linkedin", "instagram", "youtube"],
+                },
+            )
+        self.assertEqual(response.status_code, 200)
+        self.assertIn(b"Instagram search failed", response.data)
+        self.assertIn(b"Jane Doe - Video Editor", response.data)
+        self.assertIn(b"Jane Doe editing", response.data)
+        self.assertIn(b"Unverified suggestion", response.data)
+        self.assertIn(b"3 searches will use 3 Serper credits", response.data)
+
+    def test_platform_search_cache_reuses_each_platform_results(self):
+        web_calls = []
+
+        def web_search(query, num, page):
+            web_calls.append(query)
+            if "instagram.com" in query:
+                return [{
+                    "title": "Jane (@jane.editor) • Instagram",
+                    "link": "https://instagram.com/jane.editor/",
+                    "snippet": "Jane Doe creator",
+                }]
+            return [{
+                "title": "Jane Doe - Video Editor",
+                "link": "https://linkedin.com/in/jane-doe-123",
+                "snippet": "Jane Doe editor",
+            }]
+
+        data = {
+            "mode": "person",
+            "person_input": "Jane Doe",
+            "role": "",
+            "city": "",
+            "filter_status": "any",
+            "org_type": "",
+            "org_name": "",
+            "exclude_words": "",
+            "platforms_enabled": "1",
+            "platforms": ["linkedin", "instagram"],
+        }
+        with patch("app.search_web", side_effect=web_search):
+            first = self.client.post("/search", data=data)
+            second = self.client.post("/search", data=data)
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(web_calls.__len__(), 2)
+        self.assertIn(b"Cached", second.data)
+
+    def test_find_more_links_confirm_dismiss_and_unique_url(self):
+        profile = {
+            "name": "Jane Doe",
+            "url": "https://www.linkedin.com/in/jane-doe-123",
+            "org_name": "Acme Studio",
+        }
+        self.client.post("/shortlist", data={"profile": json.dumps(profile)})
+        with connect(self.database_path) as connection:
+            person_id = connection.execute(
+                "SELECT id FROM people WHERE name = 'Jane Doe'"
+            ).fetchone()["id"]
+
+        def web_search(query, num, page):
+            if "instagram.com" in query:
+                return [
+                    {
+                        "title": "Jane Doe (@jane.editor) • Instagram",
+                        "link": "https://www.instagram.com/jane.editor/?igsh=abc",
+                        "snippet": "Jane Doe video editor",
+                    },
+                    {
+                        "title": "Jane Doe (@jane.editor) • Instagram",
+                        "link": "https://instagram.com/jane.editor/",
+                        "snippet": "Duplicate URL",
+                    },
+                ]
+            return [{
+                "title": "Jane Doe channel",
+                "link": "https://youtube.com/@janedoe",
+                "snippet": "Jane Doe video editor",
+            }]
+
+        with patch("app.search_web", side_effect=web_search), patch(
+            "app.search_videos", return_value=[]
+        ):
+            response = self.client.post(f"/people/{person_id}/find-links")
+        self.assertEqual(response.status_code, 302)
+        with connect(self.database_path) as connection:
+            links = connection.execute(
+                "SELECT * FROM person_links WHERE person_id = ? AND platform != 'linkedin'",
+                (person_id,),
+            ).fetchall()
+        self.assertEqual(len(links), 2)
+        instagram = next(link for link in links if link["platform"] == "instagram")
+        youtube = next(link for link in links if link["platform"] == "youtube")
+        self.client.post(
+            f"/people/{person_id}/links/{instagram['id']}/confirm"
+        )
+        self.client.post(
+            f"/people/{person_id}/links/{youtube['id']}/dismiss"
+        )
+        with connect(self.database_path) as connection:
+            person = connection.execute(
+                "SELECT instagram_handle FROM people WHERE id = ?", (person_id,)
+            ).fetchone()
+            instagram = connection.execute(
+                "SELECT confirmed, handle FROM person_links WHERE id = ?",
+                (instagram["id"],),
+            ).fetchone()
+            youtube = connection.execute(
+                "SELECT dismissed, confirmed FROM person_links WHERE id = ?",
+                (youtube["id"],),
+            ).fetchone()
+        self.assertEqual(person["instagram_handle"], "jane.editor")
+        self.assertEqual(instagram["confirmed"], 1)
+        self.assertEqual(instagram["handle"], "jane.editor")
+        self.assertEqual(youtube["dismissed"], 1)
+        self.assertEqual(youtube["confirmed"], 0)
+        shortlist = self.client.get("/shortlist")
+        self.assertIn(b"Open Instagram DM", shortlist.data)
+        self.assertIn(b"ig.me/m/jane.editor", shortlist.data)
+
+    def test_manual_instagram_handle_is_normalized_and_rejects_invalid_values(self):
+        profile = {
+            "name": "Manual Instagram",
+            "url": "https://www.linkedin.com/in/manual-instagram-123",
+        }
+        self.client.post("/shortlist", data={"profile": json.dumps(profile)})
+        with connect(self.database_path) as connection:
+            person_id = connection.execute(
+                "SELECT id FROM people WHERE name = 'Manual Instagram'"
+            ).fetchone()["id"]
+        response = self.client.post(
+            f"/people/{person_id}/save",
+            data={
+                "personal_note": "their editing",
+                "verified_status": "unverified",
+                "instagram_handle": "https://www.instagram.com/Manual.Handle/?utm=one",
+            },
+        )
+        self.assertEqual(response.status_code, 302)
+        with connect(self.database_path) as connection:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT instagram_handle FROM people WHERE id = ?", (person_id,)
+                ).fetchone()["instagram_handle"],
+                "Manual.Handle",
+            )
+        rejected = self.client.post(
+            f"/people/{person_id}/save",
+            data={
+                "personal_note": "their editing",
+                "verified_status": "unverified",
+                "instagram_handle": "https://instagram.com/p/postid/",
+            },
+        )
+        self.assertEqual(rejected.status_code, 302)
+        with connect(self.database_path) as connection:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT instagram_handle FROM people WHERE id = ?", (person_id,)
+                ).fetchone()["instagram_handle"],
+                "Manual.Handle",
+            )
+
+    def test_instagram_and_youtube_export_columns_are_in_csv_and_excel(self):
+        profile = {
+            "name": "Export links",
+            "url": "https://www.linkedin.com/in/export-links-123",
+        }
+        self.client.post("/shortlist", data={"profile": json.dumps(profile)})
+        with connect(self.database_path) as connection:
+            person_id = connection.execute(
+                "SELECT id FROM people WHERE name = 'Export links'"
+            ).fetchone()["id"]
+            connection.execute(
+                """INSERT INTO person_links
+                   (person_id, platform, kind, url, handle, confidence, confirmed)
+                   VALUES (?, 'instagram', 'profile', ?, 'export.handle', 'likely', 1)""",
+                (person_id, "https://www.instagram.com/export.handle/"),
+            )
+            connection.execute(
+                """INSERT INTO person_links
+                   (person_id, platform, kind, url, confidence, confirmed)
+                   VALUES (?, 'youtube', 'channel', ?, 'likely', 1)""",
+                (person_id, "https://www.youtube.com/@export"),
+            )
+            connection.execute(
+                "UPDATE people SET instagram_handle = '+formula' WHERE id = ?",
+                (person_id,),
+            )
+        csv_response = self.client.get("/export.csv")
+        self.assertIn(b"Instagram handle", csv_response.data)
+        self.assertIn(b"Confirmed Instagram link", csv_response.data)
+        self.assertIn(b"Confirmed YouTube link", csv_response.data)
+        self.assertIn(b"'+formula", csv_response.data)
+        workbook = load_workbook(
+            BytesIO(self.client.get("/export.xlsx").data), data_only=False
+        )
+        headers = [cell.value for cell in workbook["Outreach"][1]]
+        self.assertIn("Instagram handle", headers)
+        self.assertIn("Confirmed Instagram link", headers)
+        self.assertIn("Confirmed YouTube link", headers)
+        self.assertEqual(workbook["Outreach"].cell(2, headers.index("Instagram handle") + 1).value, "'+formula")
+
+    def test_common_messages_are_saved_per_kind_with_personal_details(self):
+        response = self.client.post(
+            "/shortlist/messages",
+            data={
+                "action": "save",
+                "kind": "connection",
+                "common_message": "Hi {first_name}, {specific_note}",
+                "my_name": "Sam",
+                "message_link": "https://example.test/work",
+            },
+        )
+        self.assertEqual(response.status_code, 302)
+        with connect(self.database_path) as connection:
+            values = {
+                row["key"]: row["value"]
+                for row in connection.execute("SELECT key, value FROM settings")
+            }
+        self.assertEqual(values["common_connection"], "Hi {first_name}, {specific_note}")
+        self.assertEqual(values["my_name"], "Sam")
+        self.assertEqual(values["link"], "https://example.test/work")
+        self.client.post(
+            "/shortlist/messages",
+            data={
+                "action": "save",
+                "kind": "follow_up",
+                "common_message": "Thanks {first_name}",
+                "my_name": "Sam",
+                "message_link": "https://example.test/work",
+            },
+        )
+        with connect(self.database_path) as connection:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT value FROM settings WHERE key = 'common_follow_up'"
+                ).fetchone()["value"],
+                "Thanks {first_name}",
+            )
+        page = self.client.get("/shortlist")
+        self.assertIn(b"data-connection=", page.data)
+        self.assertIn(b"Only the people I tick", page.data)
+        self.assertIn(b"This only prepares text and links", page.data)
+
+    def test_generate_drafts_for_selected_or_all_shortlisted_people(self):
+        first_id = self.shortlist_profile("Asha Rao", "asha-rao-123")
+        second_id = self.shortlist_profile("Bala Kumar", "bala-kumar-123")
+        data = {
+            "action": "generate",
+            "kind": "connection",
+            "common_message": "Hello {first_name}, {specific_note}",
+            "apply_to": "selected",
+            "person_ids": str(first_id),
+        }
+        self.client.post("/shortlist/messages", data=data)
+        with connect(self.database_path) as connection:
+            drafts = connection.execute(
+                "SELECT person_id, draft_text FROM messages WHERE channel = 'connection'"
+            ).fetchall()
+        self.assertEqual(len(drafts), 1)
+        self.assertEqual(drafts[0]["person_id"], first_id)
+        self.assertEqual(drafts[0]["draft_text"], "Hello Asha")
+
+        self.client.post(
+            "/shortlist/messages",
+            data={**data, "apply_to": "all", "person_ids": ""},
+        )
+        with connect(self.database_path) as connection:
+            drafts = connection.execute(
+                "SELECT person_id FROM messages WHERE channel = 'connection'"
+            ).fetchall()
+        self.assertEqual({row["person_id"] for row in drafts}, {first_id, second_id})
+
+    def test_generation_skips_edited_drafts_and_overwrites_only_when_requested(self):
+        person_id = self.shortlist_profile("Edited Person", "edited-person-123")
+        with connect(self.database_path) as connection:
+            connection.execute(
+                """INSERT INTO messages
+                   (person_id, channel, draft_text, is_edited)
+                   VALUES (?, 'connection', 'Hand-edited', 1)""",
+                (person_id,),
+            )
+        self.client.post(
+            "/shortlist/messages",
+            data={
+                "action": "generate",
+                "kind": "connection",
+                "common_message": "Common for {first_name}",
+                "apply_to": "all",
+            },
+        )
+        with connect(self.database_path) as connection:
+            draft = connection.execute(
+                "SELECT draft_text, is_edited FROM messages WHERE person_id = ? "
+                "AND channel = 'connection' ORDER BY id DESC LIMIT 1",
+                (person_id,),
+            ).fetchone()
+        self.assertEqual(draft["draft_text"], "Hand-edited")
+        self.assertEqual(draft["is_edited"], 1)
+
+        self.client.post(
+            "/shortlist/messages",
+            data={
+                "action": "generate",
+                "kind": "connection",
+                "common_message": "Common for {first_name}",
+                "apply_to": "all",
+                "overwrite_edited": "1",
+            },
+        )
+        with connect(self.database_path) as connection:
+            draft = connection.execute(
+                "SELECT draft_text, is_edited FROM messages WHERE person_id = ? "
+                "AND channel = 'connection' ORDER BY id DESC LIMIT 1",
+                (person_id,),
+            ).fetchone()
+        self.assertEqual(draft["draft_text"], "Common for Edited")
+        self.assertEqual(draft["is_edited"], 0)
+        self.assertIn(b"Edited", self.client.get("/shortlist").data)
+
+    def test_generation_skips_contacted_people_and_enforces_followup_status(self):
+        sent_id = self.shortlist_profile("Sent Person", "sent-person-123", "sent")
+        connected_id = self.shortlist_profile(
+            "Connected Person", "connected-person-123", "connected"
+        )
+        new_id = self.shortlist_profile("New Person", "new-person-123", "new")
+        connection_data = {
+            "action": "generate",
+            "kind": "connection",
+            "common_message": "Hi {first_name}",
+            "apply_to": "all",
+        }
+        self.client.post("/shortlist/messages", data=connection_data)
+        with connect(self.database_path) as connection:
+            connection_ids = {
+                row["person_id"]
+                for row in connection.execute(
+                    "SELECT person_id FROM messages WHERE channel = 'connection'"
+                )
+            }
+        self.assertNotIn(sent_id, connection_ids)
+        self.assertNotIn(connected_id, connection_ids)
+
+        self.client.post(
+            "/shortlist/messages",
+            data={
+                "action": "generate",
+                "kind": "connection",
+                "common_message": "Hi {first_name}",
+                "apply_to": "all",
+                "include_contacted": "1",
+            },
+        )
+        follow_data = {
+            "action": "generate",
+            "kind": "follow_up",
+            "common_message": "Follow-up {first_name}",
+            "apply_to": "all",
+        }
+        self.client.post("/shortlist/messages", data=follow_data)
+        with connect(self.database_path) as connection:
+            follow_ids = {
+                row["person_id"]
+                for row in connection.execute(
+                    "SELECT person_id FROM messages WHERE channel = 'follow_up'"
+                )
+            }
+        self.assertEqual(follow_ids, {connected_id})
+        self.assertNotIn(new_id, follow_ids)
+
+    def test_connection_draft_limit_is_299_characters(self):
+        person_id = self.shortlist_profile("Long Draft", "long-draft-123")
+        accepted = self.client.post(
+            f"/people/{person_id}/draft/save",
+            data={"channel": "connection", "draft_text": "x" * 299},
+        )
+        self.assertEqual(accepted.status_code, 302)
+        rejected = self.client.post(
+            f"/people/{person_id}/draft/save",
+            data={"channel": "connection", "draft_text": "x" * 300},
+        )
+        self.assertEqual(rejected.status_code, 302)
+        with connect(self.database_path) as connection:
+            rows = connection.execute(
+                "SELECT draft_text FROM messages WHERE person_id = ?",
+                (person_id,),
+            ).fetchall()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(len(rows[0]["draft_text"]), 299)
+
+    def test_mark_sent_logs_text_status_and_four_day_followup_in_ist(self):
+        person_id = self.shortlist_profile("Sent Log", "sent-log-123")
+        response = self.client.post(
+            f"/people/{person_id}/sent",
+            data={
+                "kind": "connection",
+                "sent_text": "Exact message I sent",
+            },
+        )
+        self.assertEqual(response.status_code, 302)
+        with connect(self.database_path) as connection:
+            person = connection.execute(
+                "SELECT status, sent_at, status_changed_at, touch_count, follow_up_date "
+                "FROM people WHERE id = ?",
+                (person_id,),
+            ).fetchone()
+            sent_message = connection.execute(
+                "SELECT kind, text, sent_at FROM sent_messages WHERE person_id = ?",
+                (person_id,),
+            ).fetchone()
+            history = connection.execute(
+                "SELECT old_status, new_status, changed_at FROM status_history "
+                "WHERE person_id = ? ORDER BY id DESC LIMIT 1",
+                (person_id,),
+            ).fetchone()
+        sent_at = datetime.fromisoformat(person["sent_at"])
+        self.assertEqual(sent_at.utcoffset(), timedelta(hours=5, minutes=30))
+        self.assertEqual(person["status"], "sent")
+        self.assertEqual(person["status_changed_at"], person["sent_at"])
+        self.assertEqual(person["touch_count"], 1)
+        self.assertEqual(person["follow_up_date"], (sent_at.date() + timedelta(days=4)).isoformat())
+        self.assertEqual(sent_message["kind"], "connection")
+        self.assertEqual(sent_message["text"], "Exact message I sent")
+        self.assertEqual(sent_message["sent_at"], person["sent_at"])
+        self.assertEqual(history["old_status"], "shortlisted")
+        self.assertEqual(history["new_status"], "sent")
+        self.assertEqual(history["changed_at"], person["sent_at"])
+        self.assertIn(b"of 10 sent today", self.client.get("/shortlist").data)
+
+    def test_marking_same_kind_sent_requires_confirmation(self):
+        person_id = self.shortlist_profile("Duplicate Send", "duplicate-send-123")
+        send_data = {"kind": "connection", "sent_text": "Same kind"}
+        self.client.post(f"/people/{person_id}/sent", data=send_data)
+        response = self.client.post(f"/people/{person_id}/sent", data=send_data)
+        self.assertEqual(response.status_code, 302)
+        with connect(self.database_path) as connection:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM sent_messages WHERE person_id = ?",
+                    (person_id,),
+                ).fetchone()[0],
+                1,
+            )
+        self.client.post(
+            f"/people/{person_id}/sent",
+            data={**send_data, "confirm_duplicate": "1"},
+        )
+        with connect(self.database_path) as connection:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM sent_messages WHERE person_id = ?",
+                    (person_id,),
+                ).fetchone()[0],
+                2,
+            )
+
+    def test_tracker_due_filter_and_new_export_fields(self):
+        today = datetime.now(ZoneInfo("Asia/Kolkata")).date()
+        with connect(self.database_path) as connection:
+            batch_id = connection.execute(
+                "INSERT INTO batches (name, is_current) VALUES ('Due batch', 1)"
+            ).lastrowid
+            for name, follow_date in (
+                ("Overdue", (today - timedelta(days=1)).isoformat()),
+                ("Due today", today.isoformat()),
+                ("Future", (today + timedelta(days=2)).isoformat()),
+            ):
+                cursor = connection.execute(
+                    """INSERT INTO people
+                       (name, url, batch_id, follow_up_date, source, referred_by, touch_count)
+                       VALUES (?, ?, ?, ?, 'Referral', 'Alex', 2)""",
+                    (
+                        name,
+                        f"https://www.linkedin.com/in/{name.lower()}-due-123",
+                        batch_id,
+                        follow_date,
+                    ),
+                )
+                if name == "Overdue":
+                    connection.execute(
+                        """INSERT INTO sent_messages
+                           (person_id, kind, text, sent_at)
+                           VALUES (?, 'connection', '+sent message', ?)""",
+                        (cursor.lastrowid, datetime.now(ZoneInfo("Asia/Kolkata")).isoformat()),
+                    )
+        due = self.client.get("/tracker?due=1")
+        self.assertIn(b"Overdue", due.data)
+        self.assertIn(b"Due today", due.data)
+        self.assertNotIn(b"Future", due.data)
+        csv_response = self.client.get("/export.csv?due=1")
+        self.assertIn(b"Referred by", csv_response.data)
+        self.assertIn(b"Touch count", csv_response.data)
+        self.assertIn(b"Follow-up date", csv_response.data)
+        self.assertIn(b"Last sent message", csv_response.data)
+        self.assertIn(b"'+sent message", csv_response.data)
+        workbook = load_workbook(
+            BytesIO(self.client.get("/export.xlsx?due=1").data), data_only=False
+        )
+        headers = [cell.value for cell in workbook["Outreach"][1]]
+        for header in (
+            "Source", "Referred by", "Touch count", "Follow-up date",
+            "Sent at", "Last sent message",
+        ):
+            self.assertIn(header, headers)
+        name_index = headers.index("Name") + 1
+        sent_index = headers.index("Last sent message") + 1
+        overdue_row = next(
+            row
+            for row in range(2, workbook["Outreach"].max_row + 1)
+            if workbook["Outreach"].cell(row, name_index).value == "Overdue"
+        )
+        self.assertEqual(
+            workbook["Outreach"].cell(overdue_row, sent_index).value,
+            "'+sent message",
+        )
+        self.assertEqual(
+            workbook["Outreach"].cell(2, headers.index("Source") + 1).value,
+            "Referral",
+        )
+        self.assertEqual(
+            workbook["Outreach"].cell(2, headers.index("Referred by") + 1).value,
+            "Alex",
+        )
+        self.assertEqual(
+            workbook["Outreach"].cell(2, headers.index("Touch count") + 1).value,
+            2,
+        )
+
+    def test_connected_status_check_rebuild_preserves_rows_and_foreign_keys(self):
+        legacy_path = str(Path(self.temp_dir.name) / "checked-legacy.sqlite3")
+        legacy = sqlite3.connect(legacy_path)
+        legacy.executescript(
+            """PRAGMA foreign_keys = ON;
+            CREATE TABLE batches (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT '', is_current INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE people (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL,
+                headline TEXT NOT NULL DEFAULT '', snippet TEXT NOT NULL DEFAULT '',
+                url TEXT NOT NULL UNIQUE, college TEXT NOT NULL DEFAULT '',
+                source TEXT NOT NULL DEFAULT 'Serper.dev',
+                personal_note TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'new'
+                    CHECK (status IN ('new', 'shortlisted', 'sent', 'replied', 'agreed', 'rejected')),
+                created_at TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL DEFAULT '',
+                sent_at TEXT, batch_id INTEGER REFERENCES batches(id),
+                shortlisted_at TEXT, status_changed_at TEXT
+            );
+            CREATE TABLE messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                person_id INTEGER NOT NULL REFERENCES people(id) ON DELETE CASCADE,
+                channel TEXT NOT NULL, draft_text TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT ''
+            );
+            INSERT INTO batches (name, is_current) VALUES ('Old batch', 1);
+            INSERT INTO people (name, url, source, status, batch_id)
+                VALUES ('Legacy connected', 'https://www.linkedin.com/in/legacy-checked',
+                        'Serper.dev', 'sent', 1);
+            INSERT INTO messages (person_id, channel, draft_text) VALUES (1, 'connection', 'Keep this draft');
+            """
+        )
+        legacy.commit()
+        legacy.close()
+        init_db(legacy_path)
+        init_db(legacy_path)
+        with connect(legacy_path) as connection:
+            connection.execute("UPDATE people SET status = 'connected' WHERE id = 1")
+            person = connection.execute(
+                "SELECT id, name, source, status, batch_id, touch_count FROM people"
+            ).fetchone()
+            draft = connection.execute("SELECT draft_text FROM messages").fetchone()
+            violations = connection.execute("PRAGMA foreign_key_check").fetchall()
+        self.assertEqual(person["id"], 1)
+        self.assertEqual(person["name"], "Legacy connected")
+        self.assertEqual(person["source"], "Serper.dev")
+        self.assertEqual(person["status"], "connected")
+        self.assertEqual(person["batch_id"], 1)
+        self.assertEqual(person["touch_count"], 0)
+        self.assertEqual(draft["draft_text"], "Keep this draft")
+        self.assertEqual(violations, [])
 
 
 if __name__ == "__main__":

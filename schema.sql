@@ -5,10 +5,10 @@ CREATE TABLE IF NOT EXISTS people (
     snippet TEXT NOT NULL DEFAULT '',
     url TEXT NOT NULL UNIQUE,
     college TEXT NOT NULL DEFAULT '',
-    source TEXT NOT NULL DEFAULT 'Serper.dev',
+    source TEXT NOT NULL DEFAULT 'LinkedIn',
     personal_note TEXT NOT NULL DEFAULT '',
     status TEXT NOT NULL DEFAULT 'new'
-        CHECK (status IN ('new', 'shortlisted', 'sent', 'replied', 'agreed', 'rejected')),
+        CHECK (status IN ('new', 'shortlisted', 'sent', 'connected', 'replied', 'agreed', 'rejected')),
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     sent_at TEXT,
@@ -21,8 +21,31 @@ CREATE TABLE IF NOT EXISTS people (
     status_hint TEXT NOT NULL DEFAULT 'unclear',
     years_text TEXT NOT NULL DEFAULT '',
     verified_status TEXT NOT NULL DEFAULT 'unverified',
-    verified_note TEXT NOT NULL DEFAULT ''
+    verified_note TEXT NOT NULL DEFAULT '',
+    instagram_handle TEXT NOT NULL DEFAULT '',
+    referred_by TEXT NOT NULL DEFAULT '',
+    touch_count INTEGER NOT NULL DEFAULT 0,
+    follow_up_date TEXT NOT NULL DEFAULT ''
 );
+
+CREATE TABLE IF NOT EXISTS person_links (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    person_id INTEGER NOT NULL REFERENCES people(id) ON DELETE CASCADE,
+    platform TEXT NOT NULL CHECK (platform IN ('linkedin', 'instagram', 'youtube')),
+    kind TEXT NOT NULL,
+    url TEXT NOT NULL,
+    title TEXT NOT NULL DEFAULT '',
+    snippet TEXT NOT NULL DEFAULT '',
+    handle TEXT NOT NULL DEFAULT '',
+    confidence TEXT NOT NULL DEFAULT 'unsure'
+        CHECK (confidence IN ('likely', 'possible', 'unsure')),
+    confirmed INTEGER NOT NULL DEFAULT 0 CHECK (confirmed IN (0, 1)),
+    dismissed INTEGER NOT NULL DEFAULT 0 CHECK (dismissed IN (0, 1)),
+    found_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    UNIQUE (person_id, url)
+);
+
+CREATE INDEX IF NOT EXISTS idx_person_links_person ON person_links(person_id);
 
 CREATE TABLE IF NOT EXISTS batches (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -36,7 +59,21 @@ CREATE TABLE IF NOT EXISTS messages (
     person_id INTEGER NOT NULL REFERENCES people(id) ON DELETE CASCADE,
     channel TEXT NOT NULL,
     draft_text TEXT NOT NULL,
-    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    is_edited INTEGER NOT NULL DEFAULT 0 CHECK (is_edited IN (0, 1))
+);
+
+CREATE TABLE IF NOT EXISTS settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL DEFAULT ''
+);
+
+CREATE TABLE IF NOT EXISTS sent_messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    person_id INTEGER NOT NULL REFERENCES people(id) ON DELETE CASCADE,
+    kind TEXT NOT NULL CHECK (kind IN ('connection', 'follow_up')),
+    text TEXT NOT NULL,
+    sent_at TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS status_history (
@@ -67,3 +104,4 @@ CREATE TABLE IF NOT EXISTS searches (
 CREATE INDEX IF NOT EXISTS idx_people_status ON people(status);
 CREATE INDEX IF NOT EXISTS idx_people_sent_at ON people(sent_at);
 CREATE INDEX IF NOT EXISTS idx_messages_person_id ON messages(person_id);
+CREATE INDEX IF NOT EXISTS idx_sent_messages_person_id ON sent_messages(person_id);

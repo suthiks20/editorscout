@@ -8,8 +8,8 @@
     <p>Keep your outreach thoughtful and record each status yourself.</p>
   </div>
   <div class="export-actions">
-    <a class="button button-secondary" href="{{ url_for('export_csv', status=status_filter or None, verified_current='1' if verified_current else None, batch=batch_filter or None) }}">Export CSV</a>
-    <a class="button button-primary" href="{{ url_for('export_xlsx', status=status_filter or None, verified_current='1' if verified_current else None, batch=batch_filter or None) }}">Export Excel</a>
+    <a class="button button-secondary" href="{{ url_for('export_csv', status=status_filter or None, verified_current='1' if verified_current else None, batch=batch_filter or None, due='1' if due_filter else None) }}">Export CSV</a>
+    <a class="button button-primary" href="{{ url_for('export_xlsx', status=status_filter or None, verified_current='1' if verified_current else None, batch=batch_filter or None, due='1' if due_filter else None) }}">Export Excel</a>
   </div>
 </section>
 <div class="daily-count {% if sent_today > warning_threshold %}daily-count-warning{% endif %}">
@@ -30,6 +30,7 @@
     <option value="current" {% if batch_filter == 'current' %}selected{% endif %}>Current only</option>
     {% for batch in batches %}<option value="{{ batch.id }}" {% if batch_filter|string == batch.id|string %}selected{% endif %}>{{ batch.name }}</option>{% endfor %}
   </select>
+  <label class="checkbox-label"><input type="checkbox" name="due" value="1" {% if due_filter %}checked{% endif %}> Due today / overdue</label>
   <button class="button button-secondary" type="submit">Apply filters</button>
 </form>
 {% if people %}
@@ -47,10 +48,18 @@
         <p class="muted small">Batch: {{ person.batch_name or 'Earlier outreach' }}{% if person.removed_from_shortlist %} · Removed from shortlist{% endif %}</p>
         <p class="muted small">Manually verified: {{ person.verified_status|title }}{% if person.verified_note %} · {{ person.verified_note }}{% endif %}</p>
         <p class="muted small">Added {{ person.created_at[:10] }}{% if person.sent_at %} · Sent {{ person.sent_at[:10] }}{% endif %}{% if person.last_status_changed_at %} · Last status change {{ person.last_status_changed_at }}{% endif %}</p>
+        <p class="muted small">Source: {{ person.source }}{% if person.referred_by %} · Referred by {{ person.referred_by }}{% endif %} · Touches: {{ person.touch_count }}{% if person.follow_up_date %} · Follow-up: {{ person.follow_up_date }}{% endif %}</p>
+        {% if person.last_sent_text %}
+          <details class="last-sent-details">
+            <summary>Last sent message</summary>
+            <p>{{ person.last_sent_text }}</p>
+          </details>
+        {% endif %}
         <form class="tracker-edit" method="post" action="{{ url_for('update_person', person_id=person.id) }}">
           <input type="hidden" name="return_status" value="{{ status_filter }}">
           <input type="hidden" name="return_verified_current" value="{% if verified_current %}1{% endif %}">
           <input type="hidden" name="return_batch" value="{{ batch_filter }}">
+          <input type="hidden" name="return_due" value="{% if due_filter %}1{% endif %}">
           <label>Status
             <select name="status">
               {% for status in statuses %}<option value="{{ status }}" {% if person.status == status %}selected{% endif %}>{{ status|title }}</option>{% endfor %}
@@ -59,8 +68,31 @@
           <label>Personal note
             <textarea name="personal_note" maxlength="1000" rows="2">{{ person.personal_note }}</textarea>
           </label>
+          <label>Source
+            <select name="source">
+              {% if person.source not in sources %}<option value="{{ person.source }}" selected>{{ person.source }}</option>{% endif %}
+              {% for source in sources %}<option value="{{ source }}" {% if person.source == source %}selected{% endif %}>{{ source }}</option>{% endfor %}
+            </select>
+          </label>
+          <label>Referred by
+            <input name="referred_by" maxlength="200" value="{{ person.referred_by }}">
+          </label>
+          <label>Follow-up date
+            <input type="date" name="follow_up_date" value="{{ person.follow_up_date }}">
+          </label>
           <button class="button button-secondary" type="submit">Save changes</button>
         </form>
+        {% if person.status != 'connected' %}
+          <form method="post" action="{{ url_for('update_person', person_id=person.id) }}">
+            <input type="hidden" name="status" value="connected">
+            <input type="hidden" name="personal_note" value="{{ person.personal_note }}">
+            <input type="hidden" name="return_status" value="{{ status_filter }}">
+            <input type="hidden" name="return_verified_current" value="{% if verified_current %}1{% endif %}">
+            <input type="hidden" name="return_batch" value="{{ batch_filter }}">
+            <input type="hidden" name="return_due" value="{% if due_filter %}1{% endif %}">
+            <button class="button button-secondary" type="submit">Mark connected</button>
+          </form>
+        {% endif %}
       </article>
     {% endfor %}
   </div>

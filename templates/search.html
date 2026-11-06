@@ -1,5 +1,15 @@
 {% extends "base.html" %}
 {% block title %}Discover creators · EditorScout{% endblock %}
+{% macro hidden_search_filters(filters) %}
+  {% for key, value in filters.items() %}
+    {% if key == 'platforms' %}
+      {% for platform in value %}<input type="hidden" name="platforms" value="{{ platform }}">{% endfor %}
+    {% elif key != 'platforms_enabled' %}
+      <input type="hidden" name="{{ key }}" value="{{ value }}">
+    {% endif %}
+  {% endfor %}
+  {% if filters.get('mode') == 'person' %}<input type="hidden" name="platforms_enabled" value="1">{% endif %}
+{% endmacro %}
 {% block content %}
 <section class="page-heading">
   <p class="eyebrow">DISCOVER</p>
@@ -16,6 +26,16 @@
   <label id="person-input-field" {% if filters.get('mode', 'browse') != 'person' %}hidden{% endif %}>Name or LinkedIn ID / profile URL
     <input name="person_input" value="{{ filters.get('person_input', '') }}" maxlength="100" placeholder="Name, profile URL, or LinkedIn ID" {% if filters.get('mode', 'browse') != 'person' %}disabled{% endif %}>
   </label>
+  <fieldset class="platform-checkboxes" id="platform-fields" {% if filters.get('mode', 'browse') != 'person' %}hidden{% endif %}>
+    <legend>Search platforms</legend>
+    <input type="hidden" name="platforms_enabled" value="1">
+    {% set selected_platforms = filters.get('platforms', ['linkedin']) %}
+    {% if selected_platforms is string %}{% set selected_platforms = [selected_platforms] %}{% endif %}
+    {% for platform in platforms %}
+      <label><input type="checkbox" name="platforms" value="{{ platform }}" {% if platform in selected_platforms %}checked{% endif %}> {{ platform|title }}</label>
+    {% endfor %}
+    <p class="form-footnote"><strong id="platform-credit-estimate">{{ selected_platforms|length }} searches will use {{ selected_platforms|length }} Serper credits</strong>. A YouTube fallback may use one extra credit if video results are empty.</p>
+  </fieldset>
   <div class="form-grid">
     <label id="role-field">Role keyword
       <select name="role" id="role-input" required>
@@ -64,7 +84,7 @@
   </div>
   <input type="hidden" name="page" value="1">
   <button class="button button-primary" type="submit">Search public web results</button>
-  <p class="form-footnote">Search results can't confirm identity or dates; verify dates on the profile. Check the photo, name and organisation on the profile before shortlisting. No LinkedIn credentials, scraping, or browser automation.</p>
+  <p class="form-footnote">Search results can't confirm identity or dates; verify dates on the profile. Check the photo, name and organisation on the profile before shortlisting. The app uses Serper result metadata only and never fetches platform pages.</p>
 </form>
 
 {% if results is not none %}
@@ -75,20 +95,59 @@
         <h2>Search results</h2>
         <p class="muted">Query: <code>{{ search_query }}</code>{% if cached %} · Cached result{% endif %}</p>
       </div>
-      <span class="result-count">{{ results|length }} profiles</span>
+      <span class="result-count">{% if platform_groups is defined %}{{ platform_groups|map(attribute='results')|map('length')|sum }}{% else %}{{ results|length }}{% endif %} profiles</span>
     </div>
     {% if filters.get('mode') == 'browse' and already_saved_count %}
       <div class="saved-toggle">
         <span>{{ already_saved_count }} already saved {% if show_saved %}shown{% else %}hidden{% endif %}</span>
         <form method="post" action="{{ url_for('search') }}">
-          {% for key, value in filters.items() %}<input type="hidden" name="{{ key }}" value="{{ value }}">{% endfor %}
+          {{ hidden_search_filters(filters) }}
           <input type="hidden" name="page" value="{{ page }}">
           <input type="hidden" name="show_saved" value="{% if not show_saved %}1{% endif %}">
           <button class="button button-secondary" type="submit">{% if show_saved %}Hide saved{% else %}Show them{% endif %}</button>
         </form>
       </div>
     {% endif %}
-    {% if results %}
+    {% if platform_groups is defined %}
+      <form method="post" action="{{ url_for('shortlist') }}">
+        {% for group in platform_groups %}
+          <section class="platform-results">
+            <h3>{{ group.platform|title }}{% if group.cached %} <span class="hint-badge">Cached</span>{% endif %}</h3>
+            <p class="muted small">Query: <code>{{ group.query }}</code></p>
+            {% if group.error %}
+              <p class="warning-banner">{{ group.platform|title }} search failed: {{ group.error }}</p>
+            {% elif group.results %}
+              <div class="platform-result-list">
+                {% for result in group.results %}
+                  <article class="platform-result-card">
+                    <div class="platform-result-heading">
+                      <strong>{{ result.title or result.handle or result.url }}</strong>
+                      <span class="hint-badge">{% if result.confidence == 'likely' %}Likely match{% elif result.confidence == 'possible' %}Possible match{% else %}Unsure match{% endif %}</span>
+                    </div>
+                    {% if result.snippet %}<p class="profile-snippet">{{ result.snippet }}</p>{% endif %}
+                    {% if result.date %}<p class="muted small">{{ result.date }}</p>{% endif %}
+                    <p class="hint-badge">Unverified suggestion</p>
+                    <a class="button button-secondary" href="{{ result.url }}" target="_blank" rel="noopener noreferrer">Open link</a>
+                    {% if result.platform == 'linkedin' %}
+                      {% if result.saved_person %}
+                        <span class="hint-badge">Already in tracker: {{ result.saved_person.batch_name }}, status {{ result.saved_person.status }}</span>
+                      {% else %}
+                        <label class="platform-shortlist-check"><input class="profile-check" type="checkbox" name="profile" value="{{ {'name': result.title.split(' - ')[0], 'headline': '', 'snippet': result.snippet, 'url': result.url, 'org_type': filters.get('org_type', ''), 'org_name': filters.get('org_name', '')}|tojson|forceescape }}" aria-label="Shortlist {{ result.title }}"> Shortlist</label>
+                      {% endif %}
+                    {% endif %}
+                  </article>
+                {% endfor %}
+              </div>
+            {% else %}
+              <p class="muted">No matching links found for this platform.</p>
+            {% endif %}
+          </section>
+        {% endfor %}
+        {% if filters.get('platforms') and 'linkedin' in filters.get('platforms') %}
+          <div class="table-actions"><button class="button button-primary" type="submit">Shortlist selected LinkedIn profiles</button></div>
+        {% endif %}
+      </form>
+    {% elif results %}
       <form method="post" action="{{ url_for('shortlist') }}">
         <div class="table-wrap">
           <table class="results-table">
@@ -128,7 +187,7 @@
     {% endif %}
     <div class="search-result-actions">
       <form method="post" action="{{ url_for('search') }}">
-        {% for key, value in filters.items() %}<input type="hidden" name="{{ key }}" value="{{ value }}">{% endfor %}
+        {{ hidden_search_filters(filters) }}
         <input type="hidden" name="page" value="{{ page }}">
         <input type="hidden" name="refresh" value="1">
         {% if show_saved %}<input type="hidden" name="show_saved" value="1">{% endif %}
@@ -139,7 +198,7 @@
       <div class="pagination">
         {% if page > 1 %}
           <form method="post" action="{{ url_for('search') }}">
-            {% for key, value in filters.items() %}<input type="hidden" name="{{ key }}" value="{{ value }}">{% endfor %}
+            {{ hidden_search_filters(filters) }}
             <input type="hidden" name="page" value="{{ page - 1 }}">
             {% if show_saved %}<input type="hidden" name="show_saved" value="1">{% endif %}
             <button class="button button-secondary" type="submit">← Previous</button>
@@ -148,7 +207,7 @@
         <span>Page {{ page }}</span>
         {% if next_page %}
           <form method="post" action="{{ url_for('search') }}">
-            {% for key, value in filters.items() %}<input type="hidden" name="{{ key }}" value="{{ value }}">{% endfor %}
+            {{ hidden_search_filters(filters) }}
             <input type="hidden" name="page" value="{{ page + 1 }}">
             {% if show_saved %}<input type="hidden" name="show_saved" value="1">{% endif %}
             <button class="button button-secondary" type="submit">Next →</button>

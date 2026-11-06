@@ -6,6 +6,39 @@ from pathlib import Path
 from profile_urls import normalize_linkedin_url
 
 
+PEOPLE_TABLE_SQL = """
+CREATE TABLE people_new (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    headline TEXT NOT NULL DEFAULT '',
+    snippet TEXT NOT NULL DEFAULT '',
+    url TEXT NOT NULL UNIQUE,
+    college TEXT NOT NULL DEFAULT '',
+    source TEXT NOT NULL DEFAULT 'LinkedIn',
+    personal_note TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'new'
+        CHECK (status IN ('new', 'shortlisted', 'sent', 'connected', 'replied', 'agreed', 'rejected')),
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    sent_at TEXT,
+    batch_id INTEGER REFERENCES batches(id),
+    shortlisted_at TEXT,
+    status_changed_at TEXT,
+    removed_from_shortlist INTEGER NOT NULL DEFAULT 0,
+    org_type TEXT NOT NULL DEFAULT '',
+    org_name TEXT NOT NULL DEFAULT '',
+    status_hint TEXT NOT NULL DEFAULT 'unclear',
+    years_text TEXT NOT NULL DEFAULT '',
+    verified_status TEXT NOT NULL DEFAULT 'unverified',
+    verified_note TEXT NOT NULL DEFAULT '',
+    instagram_handle TEXT NOT NULL DEFAULT '',
+    referred_by TEXT NOT NULL DEFAULT '',
+    touch_count INTEGER NOT NULL DEFAULT 0,
+    follow_up_date TEXT NOT NULL DEFAULT ''
+)
+"""
+
+
 @contextmanager
 def connect(database_path):
     path = Path(database_path)
@@ -44,10 +77,29 @@ def init_db(database_path, schema_path=None):
             "shortlisted_at": "TEXT",
             "status_changed_at": "TEXT",
             "removed_from_shortlist": "INTEGER NOT NULL DEFAULT 0",
+            "instagram_handle": "TEXT NOT NULL DEFAULT ''",
+            "referred_by": "TEXT NOT NULL DEFAULT ''",
+            "touch_count": "INTEGER NOT NULL DEFAULT 0",
+            "follow_up_date": "TEXT NOT NULL DEFAULT ''",
         }
         for column, definition in additions.items():
             if column not in columns:
                 connection.execute(f"ALTER TABLE people ADD COLUMN {column} {definition}")
+        _rebuild_people_for_connected_status(connection)
+        message_columns = {
+            row["name"] for row in connection.execute("PRAGMA table_info(messages)")
+        }
+        if "is_edited" not in message_columns:
+            connection.execute(
+                "ALTER TABLE messages ADD COLUMN is_edited INTEGER NOT NULL DEFAULT 0"
+            )
+        connection.execute(
+            """INSERT OR IGNORE INTO person_links
+               (person_id, platform, kind, url, title, snippet, handle, confidence,
+                confirmed, dismissed)
+               SELECT id, 'linkedin', 'profile', url, name, snippet, '', 'likely', 1, 0
+               FROM people"""
+        )
         if "college" in columns:
             connection.execute(
                 """UPDATE people SET org_name = college, org_type = 'College'
@@ -119,4 +171,48 @@ def init_db(database_path, schema_path=None):
                WHERE NOT EXISTS (
                    SELECT 1 FROM status_history h WHERE h.person_id = p.id
                )"""
+        )
+
+
+def _rebuild_people_for_connected_status(connection):
+    row = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'people'"
+    ).fetchone()
+    if row is None or "'connected'" in row["sql"]:
+        return
+
+    original_columns = [
+        column["name"] for column in connection.execute("PRAGMA table_info(people)")
+    ]
+
+    connection.commit()
+    connection.execute("PRAGMA foreign_keys = OFF")
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        connection.execute(PEOPLE_TABLE_SQL)
+        target_columns = {
+            column["name"]
+            for column in connection.execute("PRAGMA table_info(people_new)")
+        }
+        copy_columns = [name for name in original_columns if name in target_columns]
+        quoted_columns = ", ".join(f'"{name}"' for name in copy_columns)
+        connection.execute(
+            f"INSERT INTO people_new ({quoted_columns}) "
+            f"SELECT {quoted_columns} FROM people"
+        )
+        connection.execute("DROP TABLE people")
+        connection.execute("ALTER TABLE people_new RENAME TO people")
+        connection.execute("CREATE INDEX IF NOT EXISTS idx_people_status ON people(status)")
+        connection.execute("CREATE INDEX IF NOT EXISTS idx_people_sent_at ON people(sent_at)")
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.execute("PRAGMA foreign_keys = ON")
+
+    violations = connection.execute("PRAGMA foreign_key_check").fetchall()
+    if violations:
+        raise sqlite3.IntegrityError(
+            f"Foreign key violations after people migration: {len(violations)}"
         )
