@@ -1,9 +1,11 @@
 import csv
+import hashlib
 import io
 import json
 import re
 import time
 from datetime import date, datetime, timedelta
+from pathlib import Path
 from urllib.parse import parse_qsl, urlsplit
 from zoneinfo import ZoneInfo
 
@@ -72,7 +74,19 @@ MAX_NOTE_LENGTH = 1000
 MAX_DRAFT_LENGTH = 5000
 MAX_SEARCH_TEXT_LENGTH = 100
 SEARCH_CACHE_SECONDS = 10 * 60
+MAX_SERPER_CALLS_PER_SEARCH = 3
+MAX_COLLECT_CALLS = 5
+MAX_POOL_SHORTLIST = 200
+POOL_TARGET_SIZE = 50
 IST = ZoneInfo("Asia/Kolkata")
+LOCATION_DATA_DIR = Path(__file__).resolve().parent / "static" / "data"
+DEFAULT_SEARCH_LOCATION = {"country": "IN", "state": "Tamil Nadu", "city": "Coimbatore"}
+COUNTRY_NAME_BY_CODE = {
+    item["code"]: item["name"]
+    for item in json.loads(
+        (LOCATION_DATA_DIR / "countries.json").read_text(encoding="utf-8")
+    )
+}
 
 ROLE_KEYWORDS = (
     ("Content Creator", ("content creator", "creator", "youtuber", "influencer", "vlogger")),
@@ -138,8 +152,59 @@ def create_app(test_config=None):
 
     app.extensions["editorscout_db"] = db
 
+    @app.context_processor
+    def navigation_counts():
+        today = datetime.now(IST).date().isoformat()
+        with db() as connection:
+            shortlisted_today = connection.execute(
+                """SELECT COUNT(*) FROM people
+                   WHERE removed_from_shortlist = 0
+                     AND substr(COALESCE(NULLIF(shortlisted_at, ''), created_at), 1, 10) = ?""",
+                (today,),
+            ).fetchone()[0]
+            follow_ups_due = connection.execute(
+                """SELECT COUNT(*) FROM people
+                   WHERE follow_up_date != '' AND follow_up_date <= ?""",
+                (today,),
+            ).fetchone()[0]
+        return {
+            "nav_shortlist_count": shortlisted_today,
+            "nav_follow_up_count": follow_ups_due,
+            "nav_today": today,
+        }
+
     @app.get("/")
     def search_page():
+        with db() as connection:
+            settings = read_message_settings(connection)
+        location_defaults = (
+            DEFAULT_SEARCH_LOCATION
+            if "search_country" not in settings
+            else {
+                "country": settings.get("search_country", ""),
+                "state": settings.get("search_state", ""),
+                "city": settings.get("search_city", ""),
+            }
+        )
+        filters = {
+            "mode": "browse",
+            "role": ROLES[0],
+            "country": location_defaults["country"],
+            "state": location_defaults["state"],
+            "city": location_defaults["city"],
+            "city_custom": "",
+            "state_custom": "",
+            "disambiguate": False,
+            "org_type": "",
+            "org_name": "",
+            "filter_status": "any",
+            "exclude_words": DEFAULT_EXCLUDES,
+            "per_page": 10,
+        }
+        filters.update(request.args.to_dict())
+        filters["country"] = filters.get("country", location_defaults["country"])
+        filters["state"] = filters.get("state", location_defaults["state"])
+        filters["city"] = filters.get("city", location_defaults["city"])
         return render_template(
             "search.html",
             roles=ROLES,
@@ -148,7 +213,8 @@ def create_app(test_config=None):
             statuses=FILTER_STATUSES,
             platforms=SEARCH_PLATFORMS,
             default_excludes=DEFAULT_EXCLUDES,
-            filters=request.args,
+            countries=load_countries(),
+            filters=filters,
             results=None,
             page=1,
             per_page=10,
@@ -159,8 +225,8 @@ def create_app(test_config=None):
         try:
             filters = normalize_filters(request.form)
             if filters["mode"] == "browse":
-                if filters["role"] not in ROLES or not filters["city"]:
-                    raise ValueError("Choose a role and enter a city to browse.")
+                if filters["role"] and filters["role"] not in ROLES:
+                    raise ValueError("Choose a valid role to browse.")
             elif not filters["person_input"]:
                 raise ValueError("Enter a name, LinkedIn profile URL, or LinkedIn ID.")
             elif not filters["platforms"]:
@@ -176,12 +242,23 @@ def create_app(test_config=None):
                 org_types=ORG_TYPES,
                 statuses=FILTER_STATUSES,
                 platforms=SEARCH_PLATFORMS,
+                countries=load_countries(),
                 default_excludes=DEFAULT_EXCLUDES,
                 filters=error_filters,
                 results=None,
                 page=1,
                 per_page=normalize_page_size(request.form.get("per_page")),
             ), 400
+
+        with db() as connection:
+            save_message_settings(
+                connection,
+                {
+                    "search_country": filters["country"],
+                    "search_state": filters["state"],
+                    "search_city": filters["city"],
+                },
+            )
 
         page = parse_page(request.form.get("page"))
         if filters["mode"] == "person":
@@ -213,6 +290,7 @@ def create_app(test_config=None):
                 org_types=ORG_TYPES,
                 statuses=FILTER_STATUSES,
                 platforms=SEARCH_PLATFORMS,
+                countries=load_countries(),
                 default_excludes=DEFAULT_EXCLUDES,
                 filters=filters,
                 results=[],
@@ -228,63 +306,97 @@ def create_app(test_config=None):
                 selected_platform_count=len(filters["platforms"]),
                 refresh=request.form.get("refresh") == "1",
                 api_error=None,
+                location_label=format_location(filters),
             )
         query = build_query(filters)
-        results = []
-        next_page = False
-        api_error = None
-        cached = False
+        location_label = format_location(filters)
+        country_cache_key = location_cache_key(filters)
+        search_key = build_search_key(filters)
+        raw_cursor = parse_raw_cursor(
+            request.form.get("raw_page_cursor"),
+            fallback=page,
+        )
+        previous_cursors = parse_cursor_history(request.form.get("prev_cursors", ""))
+        show_saved = request.form.get("show_saved") == "1"
         refresh = request.form.get("refresh") == "1"
-        provider_results = None
-        if not refresh:
-            provider_results = get_cached_results(db, query, page, filters["per_page"])
-            cached = provider_results is not None
-        if provider_results is None:
-            try:
-                provider_results = search_web(
-                    query, num=filters["per_page"], page=page
+        collection_message = ""
+        collection_error = None
+        collection_credits = 0
+        pool_before = get_search_pool_summary(db, search_key)
+        collect_cursor = get_next_collect_page(
+            db, country_cache_key, filters["per_page"], pool_before["urls"]
+        )
+        if request.form.get("collect") == "1":
+            remaining = max(0, POOL_TARGET_SIZE - pool_before["unsaved"])
+            if remaining:
+                collection = run_browse_search(
+                    query=query,
+                    cache_query=country_cache_key,
+                    filters=filters,
+                    raw_cursor=collect_cursor,
+                    previous_cursors=[],
+                    show_saved=False,
+                    refresh=False,
+                    gl=filters["country"].lower() if filters["country"] else None,
+                    db_factory=db,
+                    max_calls=MAX_COLLECT_CALLS,
+                    max_pages=10,
+                    target_count=remaining,
+                    exclude_urls=pool_before["urls"],
                 )
-                provider_results = provider_results[:filters["per_page"]]
-                save_cached_results(
-                    db, query, page, filters["per_page"], provider_results
+                save_search_pool(db, search_key, collection["pool_profiles"])
+                pool_after = get_search_pool_summary(db, search_key)
+                collected_count = max(0, pool_after["unsaved"] - pool_before["unsaved"])
+                collection_credits = collection["used_credits"]
+                collection_error = collection["api_error"]
+                collection_cursor_after = get_next_collect_page(
+                    db,
+                    country_cache_key,
+                    filters["per_page"],
+                    pool_after["urls"],
                 )
-            except RuntimeError as exc:
-                api_error = str(exc)
-            except SearchAPIError as exc:
-                if exc.status_code in (401, 403):
-                    api_error = "Serper rejected the API key. Check SERPER_API_KEY in your .env file."
-                elif exc.status_code == 429:
-                    api_error = "Serper rate limit reached or search credits exhausted. Please try again later."
-                else:
-                    api_error = "Serper search could not complete this request. Please try again."
-            except SearchTimeoutError:
-                api_error = "Serper search timed out. Please try again."
-            except SearchConnectionError:
-                api_error = "Could not connect to Serper. Check your connection and try again."
-            except SearchResponseError:
-                api_error = "Serper returned an unreadable response. Please try again."
-
-        if provider_results is not None:
-            results = shape_results(provider_results, filters)
-            saved_people = get_saved_people_by_url(db)
-            already_saved = 0
-            for result in results:
-                saved = saved_people.get(result["url"])
-                result["saved_person"] = saved
-                if saved:
-                    already_saved += 1
-            if filters["mode"] == "browse":
-                if request.form.get("show_saved") != "1":
-                    results = [result for result in results if not result["saved_person"]]
-                else:
-                    for result in results:
-                        result["shortlist_disabled"] = bool(result["saved_person"])
+                collection_message = f"Collected {collected_count} profiles. Used {collection_credits} credits."
+                if (
+                    pool_after["unsaved"] < POOL_TARGET_SIZE
+                    and collection_cursor_after > 10
+                    and not collection_error
+                ):
+                    collection_message += (
+                        f" Google returned only {pool_after['unsaved']} usable profiles for this search."
+                    )
+                collect_cursor = collection_cursor_after
             else:
-                for result in results:
-                    result["shortlist_disabled"] = bool(result["saved_person"])
-            next_page = len(provider_results) == filters["per_page"] and page < 10
-        else:
-            already_saved = 0
+                collection_message = (
+                    f"Collected 0 profiles. Used 0 credits. "
+                    f"Google returned only {pool_before['unsaved']} usable profiles for this search."
+                )
+
+        browse_results = run_browse_search(
+            query=query,
+            cache_query=country_cache_key,
+            filters=filters,
+            raw_cursor=raw_cursor,
+            previous_cursors=previous_cursors,
+            show_saved=show_saved,
+            refresh=refresh,
+            gl=filters["country"].lower() if filters["country"] else None,
+            db_factory=db,
+        )
+        if request.form.get("skip_pool_upsert") != "1":
+            save_search_pool(db, search_key, browse_results["pool_profiles"])
+        pool_summary = get_search_pool_summary(db, search_key)
+        collect_cursor = get_next_collect_page(
+            db,
+            country_cache_key,
+            filters["per_page"],
+            pool_summary["urls"],
+        )
+        results = browse_results["results"]
+        page = browse_results["page"]
+        next_page = browse_results["next_page"]
+        cached = browse_results["cached"]
+        api_error = browse_results["api_error"]
+        already_saved = browse_results["already_saved_count"]
 
         with db() as connection:
             connection.execute(
@@ -294,6 +406,8 @@ def create_app(test_config=None):
 
         if api_error:
             flash(api_error, "error")
+        if collection_error:
+            flash(collection_error, "error")
 
         return render_template(
             "search.html",
@@ -302,6 +416,7 @@ def create_app(test_config=None):
             org_types=ORG_TYPES,
             statuses=FILTER_STATUSES,
             platforms=SEARCH_PLATFORMS,
+            countries=load_countries(),
             default_excludes=DEFAULT_EXCLUDES,
             filters=filters,
             results=results,
@@ -312,7 +427,29 @@ def create_app(test_config=None):
             cached=cached,
             refresh=refresh,
             already_saved_count=already_saved,
-            show_saved=request.form.get("show_saved") == "1",
+            show_saved=show_saved,
+            raw_page_cursor=browse_results["raw_page_cursor"],
+            next_raw_page_cursor=browse_results["next_raw_page_cursor"],
+            previous_cursors=browse_results["previous_cursors"],
+            next_previous_cursors=browse_results["next_previous_cursors"],
+            raw_result_count=browse_results["raw_result_count"],
+            non_profile_count=browse_results["non_profile_count"],
+            used_credits=browse_results["used_credits"],
+            underfilled=browse_results["underfilled"],
+            widen_search=filters["widen_search"],
+            role_helper=detect_role,
+            location_label=location_label,
+            search_key=search_key,
+            pool_count=pool_summary["unsaved"],
+            pool_total=pool_summary["total"],
+            pool_saved_count=pool_summary["saved"],
+            pool_page_count=get_cached_page_count(
+                db, country_cache_key, filters["per_page"]
+            ),
+            pool_collect_cursor=collect_cursor,
+            collection_message=collection_message,
+            collection_credits=collection_credits,
+            pool_has_more=collect_cursor <= 10,
         )
 
     @app.post("/shortlist")
@@ -325,70 +462,65 @@ def create_app(test_config=None):
             selected = [json.loads(value) for value in profiles]
         except (json.JSONDecodeError, TypeError):
             abort(400)
-        saved = 0
         with db() as connection:
             batch_id = ensure_current_batch(connection)
-            for item in selected:
-                if not isinstance(item, dict):
-                    abort(400)
-                url = normalize_linkedin_url(item.get("url", ""))
-                if url is None:
-                    abort(400)
-                org_type = str(item.get("org_type") or "").lower()
-                if org_type not in ORG_TYPES:
-                    org_type = ""
-                existing = connection.execute(
-                    "SELECT id FROM people WHERE normalize_linkedin_url(url) = ?",
-                    (url,),
-                ).fetchone()
-                if existing:
-                    continue
-                timestamp = ist_now()
-                cursor = connection.execute(
-                    """INSERT OR IGNORE INTO people
-                        (name, headline, snippet, url, college, source, status,
-                         org_type, org_name, status_hint, years_text, batch_id,
-                         shortlisted_at, status_changed_at)
-                        VALUES (?, ?, ?, ?, '', 'LinkedIn', 'shortlisted',
-                                ?, ?, ?, ?, ?, ?, ?)""",
-                    (
-                        str(item.get("name") or "LinkedIn profile")[:200],
-                        str(item.get("headline") or "")[:500],
-                        str(item.get("snippet") or "")[:2000],
-                        url[:500],
-                        org_type,
-                        str(item.get("org_name") or "")[:120],
-                        item.get("status_hint")
-                        if item.get("status_hint") in ("current", "past", "unclear")
-                        else "unclear",
-                        str(item.get("years_text") or "")[:40],
-                        batch_id,
-                        timestamp,
-                        timestamp,
-                    ),
-                )
-                saved += cursor.rowcount
-                if cursor.rowcount:
-                    connection.execute(
-                        """INSERT OR IGNORE INTO person_links
-                           (person_id, platform, kind, url, title, snippet, handle,
-                            confidence, confirmed, dismissed)
-                           VALUES (?, 'linkedin', 'profile', ?, ?, ?, '', 'likely', 1, 0)""",
-                        (
-                            cursor.lastrowid,
-                            url,
-                            str(item.get("name") or "")[:200],
-                            str(item.get("snippet") or "")[:2000],
-                        ),
-                    )
-                    connection.execute(
-                        """INSERT INTO status_history
-                           (person_id, old_status, new_status, changed_at)
-                           VALUES (?, NULL, 'shortlisted', ?)""",
-                        (cursor.lastrowid, timestamp),
-                    )
+            saved, _skipped = insert_selected_profiles(
+                connection, selected, batch_id, ist_now()
+            )
         flash(f"Shortlisted {saved} profile(s).", "success")
         return redirect(shortlist_url(date=datetime.now(IST).date().isoformat()))
+
+    @app.post("/shortlist/pool")
+    def shortlist_pool():
+        search_key = clean_pool_search_key(request.form.get("search_key", ""))
+        if request.form.get("confirm_all") != "1":
+            flash("Confirm before shortlisting all discovered profiles.", "error")
+            return redirect(url_for("search_page"))
+        with db() as connection:
+            pool_rows = connection.execute(
+                """SELECT url, profile_json FROM search_pool
+                   WHERE search_key = ? ORDER BY id""",
+                (search_key,),
+            ).fetchall()
+            saved_urls = {
+                normalize_linkedin_url(row["url"])
+                for row in connection.execute("SELECT url FROM people").fetchall()
+            }
+            unsaved_rows = [
+                row for row in pool_rows
+                if normalize_linkedin_url(row["url"]) not in saved_urls
+            ]
+            selected_rows = unsaved_rows[:MAX_POOL_SHORTLIST]
+            selected = []
+            for row in selected_rows:
+                try:
+                    selected.append(json.loads(row["profile_json"]))
+                except (json.JSONDecodeError, TypeError):
+                    abort(400)
+            skipped = len(pool_rows) - len(unsaved_rows)
+            batch_id = ensure_current_batch(connection) if selected else None
+            saved = 0
+            if selected:
+                saved, duplicate_skips = insert_selected_profiles(
+                    connection, selected, batch_id, ist_now()
+                )
+                skipped += duplicate_skips
+            remaining = max(0, len(unsaved_rows) - saved)
+        message = f"Shortlisted {saved} profiles ({skipped} already saved, skipped)"
+        if remaining:
+            message += f". {remaining} profiles left; the per-click limit is {MAX_POOL_SHORTLIST}."
+        flash(message + ".", "success")
+        return redirect(shortlist_url(date=datetime.now(IST).date().isoformat()))
+
+    @app.post("/search/pool/clear")
+    def clear_search_pool():
+        search_key = clean_pool_search_key(request.form.get("search_key", ""))
+        with db() as connection:
+            connection.execute(
+                "DELETE FROM search_pool WHERE search_key = ?", (search_key,)
+            )
+        flash("Cleared discovered profiles for this search.", "success")
+        return search()
 
     @app.get("/shortlist")
     def shortlist_page():
@@ -956,6 +1088,11 @@ def create_app(test_config=None):
             batches = connection.execute(
                 "SELECT id, name, is_current FROM batches ORDER BY created_at DESC, id DESC"
             ).fetchall()
+            tracker_sent_count = connection.execute(
+                """SELECT COUNT(*) FROM people
+                   WHERE status IN ('sent', 'connected', 'replied', 'agreed')
+                      OR touch_count >= 1"""
+            ).fetchone()[0]
             sent_timestamps = connection.execute(
                 """SELECT sent_at FROM sent_messages
                    UNION ALL
@@ -975,6 +1112,7 @@ def create_app(test_config=None):
             batch_filter=batch_filter,
             due_filter=due_filter,
             batches=batches,
+            tracker_sent_count=tracker_sent_count,
             sent_today=sent_today,
             warning_threshold=10,
             sources=SOURCES,
@@ -1192,7 +1330,21 @@ def normalize_filters(form):
     if not (len(batch_year) == 4 and batch_year.isdigit()):
         batch_year = ""
     role = clean_search_input(form.get("role", ""))
-    city = clean_search_input(form.get("city", ""))
+    country = clean_search_input(form.get("country", "")).upper()
+    if country and country not in COUNTRY_NAME_BY_CODE:
+        raise ValueError("Choose a valid country.")
+    state = normalize_location_field(
+        form.get("state_custom") or form.get("state", ""), "State"
+    )
+    city_value = form.get("city_custom") or form.get("city", "")
+    city = normalize_location_field(
+        "" if city_value == "__other__" else city_value, "City"
+    )
+    if state == "__other__":
+        state = ""
+    disambiguate = str(form.get("disambiguate", "")).lower() in (
+        "1", "true", "on", "yes"
+    )
     raw_org_name = clean_search_input(form.get("org_name", ""))
     org_name = raw_org_name if org_type else ""
     exclude_words = clean_search_input(
@@ -1208,8 +1360,7 @@ def normalize_filters(form):
         and form.get("platforms_enabled") != "1"
     ):
         platforms = ["linkedin"]
-    if mode == "browse" and not role:
-        role = ROLES[0]
+    widen_search = str(form.get("widen_search", "")).lower() in ("1", "true", "on")
     return {
         "mode": mode,
         "person_input": person_input,
@@ -1218,13 +1369,59 @@ def normalize_filters(form):
         "platforms": platforms,
         "role": role,
         "city": city,
+        "country": country,
+        "state": state,
+        "city_custom": normalize_location_field(
+            form.get("city_custom", ""), "City"
+        ),
+        "state_custom": normalize_location_field(
+            form.get("state_custom", ""), "State"
+        ),
+        "disambiguate": disambiguate,
         "org_type": org_type,
         "org_name": org_name,
         "filter_status": filter_status,
         "batch_year": batch_year if org_type in ("college", "school") else "",
         "exclude_words": exclude_words,
         "per_page": per_page,
+        "widen_search": widen_search,
     }
+
+
+def normalize_location_field(value, label):
+    text = " ".join(str(value or "").split())
+    if len(text) > 80:
+        raise ValueError(f"{label} must be 80 characters or fewer.")
+    return text.translate(str.maketrans("", "", '"()\\')).strip()
+
+
+def load_countries():
+    return json.loads(
+        (LOCATION_DATA_DIR / "countries.json").read_text(encoding="utf-8")
+    )
+
+
+def location_term(filters):
+    if filters.get("city"):
+        return filters["city"]
+    if filters.get("state"):
+        return filters["state"]
+    country = filters.get("country", "")
+    return COUNTRY_NAME_BY_CODE.get(country, "")
+
+
+def location_cache_key(filters):
+    query = build_query(filters)
+    return f"country:{filters.get('country') or 'worldwide'}:{query}"
+
+
+def format_location(filters):
+    parts = [
+        filters.get("city", ""),
+        filters.get("state", ""),
+        COUNTRY_NAME_BY_CODE.get(filters.get("country", ""), ""),
+    ]
+    return ", ".join(part for part in parts if part) or "Worldwide"
 
 
 def clean_search_input(value):
@@ -1257,19 +1454,25 @@ def platform_search_name(filters):
 
 def run_person_platform_search(filters, page, refresh, db_factory):
     name = platform_search_name(filters)
+    location = location_term(filters)
     queries = build_platform_queries(
         name,
         filters["org_name"],
-        filters["city"],
+        location,
         filters["role"],
         filters["platforms"],
     )
+    if filters.get("disambiguate") and filters.get("city") and filters.get("state"):
+        state_term = quote_search_term(filters["state"])
+        queries = {
+            platform: f"{query} {state_term}"
+            for platform, query in queries.items()
+        }
     if filters.get("person_kind") == "profile" and "linkedin" in queries:
         linkedin_terms = [f"linkedin.com/in/{filters['person_slug']}"]
         if filters["org_name"]:
             linkedin_terms.append(quote_search_term(filters["org_name"]))
-        if filters["city"]:
-            linkedin_terms.append(escape_query_fragment(filters["city"]))
+        linkedin_terms.extend(location_query_terms(filters))
         if filters["role"]:
             linkedin_terms.append(quote_search_term(filters["role"]))
         queries["linkedin"] = " ".join(linkedin_terms)
@@ -1300,6 +1503,8 @@ def run_person_platform_search(filters, page, refresh, db_factory):
             filters["per_page"],
             db_factory,
             refresh=refresh,
+            gl=filters["country"].lower() if filters["country"] else None,
+            country=filters["country"],
         )
         cache_status[platform] = cached
         if error:
@@ -1322,11 +1527,16 @@ def run_person_platform_search(filters, page, refresh, db_factory):
     return groups, queries, errors, cache_status, next_page
 
 
-def get_platform_results(platform, query, page, per_page, db_factory, refresh=False):
+def get_platform_results(
+    platform, query, page, per_page, db_factory, refresh=False, gl=None, country=""
+):
     key_prefix = "videos" if platform == "youtube" else platform
-    cache_query = f"platform:{key_prefix}:{query}"
+    cache_query = f"platform:{key_prefix}:country:{country or 'worldwide'}:{query}"
     fallback_query = f"site:youtube.com {query}" if platform == "youtube" else ""
-    fallback_key = f"platform:youtube-web:{fallback_query}" if fallback_query else ""
+    fallback_key = (
+        f"platform:youtube-web:country:{country or 'worldwide'}:{fallback_query}"
+        if fallback_query else ""
+    )
     if not refresh:
         cached_results = get_cached_results(db_factory, cache_query, page, per_page)
         if cached_results is not None and (cached_results or platform != "youtube"):
@@ -1347,7 +1557,10 @@ def get_platform_results(platform, query, page, per_page, db_factory, refresh=Fa
         if platform == "youtube":
             items = cached_results if refresh is False and cached_results is not None else None
             if items is None:
-                items = search_videos(query, num=per_page)[:per_page]
+                video_kwargs = {"num": per_page}
+                if gl is not None:
+                    video_kwargs["gl"] = gl
+                items = search_videos(query, **video_kwargs)[:per_page]
                 save_cached_results(db_factory, cache_query, page, per_page, items)
             if not items:
                 items = (
@@ -1356,12 +1569,18 @@ def get_platform_results(platform, query, page, per_page, db_factory, refresh=Fa
                     else None
                 )
                 if items is None:
-                    items = search_web(fallback_query, num=per_page, page=page)
+                    search_kwargs = {"num": per_page, "page": page}
+                    if gl is not None:
+                        search_kwargs["gl"] = gl
+                    items = search_web(fallback_query, **search_kwargs)
                     items = items[:per_page]
                     save_cached_results(db_factory, fallback_key, page, per_page, items)
                 query = fallback_query
         else:
-            items = search_web(query, num=per_page, page=page)
+            search_kwargs = {"num": per_page, "page": page}
+            if gl is not None:
+                search_kwargs["gl"] = gl
+            items = search_web(query, **search_kwargs)
             items = items[:per_page]
             save_cached_results(db_factory, cache_query, page, per_page, items)
         has_next = platform != "youtube" and len(items) == per_page and page < 10
@@ -1462,25 +1681,37 @@ def escape_query_fragment(value):
 
 
 def build_query(filters):
+    location_terms = location_query_terms(filters)
+
     if filters.get("mode") == "person":
         if filters.get("person_kind") == "profile":
             terms = [f'linkedin.com/in/{filters["person_slug"]}']
             if filters.get("role"):
                 terms.append(quote_search_term(filters["role"]))
-            if filters.get("city"):
-                terms.append(escape_query_fragment(filters["city"]))
+            terms.extend(location_terms)
         else:
             terms = ["site:linkedin.com/in", quote_search_term(filters["person_input"])]
             if filters.get("role"):
                 terms.append(quote_search_term(filters["role"]))
-            if filters.get("city"):
-                terms.append(escape_query_fragment(filters["city"]))
+            terms.extend(location_terms)
     else:
-        terms = [
-            "site:linkedin.com/in",
-            quote_search_term(filters["role"]),
-            escape_query_fragment(filters["city"]),
-        ]
+        role_term = quote_search_term(filters["role"]) if filters.get("role") else ""
+        if filters.get("widen_search") and filters.get("role"):
+            synonyms = {
+                "content creator": ("content creator", "creator", "youtuber", "influencer"),
+                "video editor": ("video editor", "video editing", "editor"),
+                "reel editor": ("reel editor", "video editor", "video editing", "editor"),
+                "videographer": ("videographer", "cinematographer", "filmmaker"),
+            }
+            terms_for_role = synonyms.get(filters["role"].casefold())
+            if terms_for_role:
+                role_term = "(" + " OR ".join(
+                    quote_search_term(term) for term in terms_for_role
+                ) + ")"
+        terms = ["site:linkedin.com/in"]
+        if role_term:
+            terms.append(role_term)
+        terms.extend(location_terms)
     if filters["org_name"]:
         terms.append(quote_search_term(filters["org_name"]))
     if filters["filter_status"] == "current":
@@ -1495,6 +1726,27 @@ def build_query(filters):
         if word.strip()
     )
     return " ".join(terms)
+
+
+def location_query_terms(filters):
+    if filters.get("disambiguate") and filters.get("city") and filters.get("state"):
+        return [
+            filters["city"]
+            if " " not in filters["city"]
+            else quote_search_term(filters["city"]),
+            quote_search_term(filters["state"]),
+        ]
+    if filters.get("city"):
+        return [
+            filters["city"]
+            if " " not in filters["city"]
+            else quote_search_term(filters["city"])
+        ]
+    if filters.get("state"):
+        return [quote_search_term(filters["state"])]
+    if filters.get("country"):
+        return [quote_search_term(COUNTRY_NAME_BY_CODE[filters["country"]])]
+    return []
 
 
 def parse_page(value):
@@ -1531,6 +1783,360 @@ def shape_results(items, filters):
             }
         )
     return shaped
+
+
+def parse_raw_cursor(value, fallback=1):
+    try:
+        cursor = int(value or fallback)
+    except (TypeError, ValueError):
+        cursor = fallback
+    return max(1, min(cursor, 10))
+
+
+def parse_cursor_history(value):
+    cursors = []
+    for item in str(value or "").split(","):
+        try:
+            cursor = int(item)
+        except ValueError:
+            continue
+        if 1 <= cursor <= 10 and (not cursors or cursor > cursors[-1]):
+            cursors.append(cursor)
+    return cursors
+
+
+def search_error_message(exc):
+    if isinstance(exc, RuntimeError):
+        return str(exc)
+    if isinstance(exc, SearchAPIError):
+        if exc.status_code in (401, 403):
+            return "Serper rejected the API key. Check SERPER_API_KEY in your .env file."
+        if exc.status_code == 429:
+            return "Serper rate limit reached or search credits exhausted. Please try again later."
+        return "Serper search could not complete this request. Please try again."
+    if isinstance(exc, SearchTimeoutError):
+        return "Serper search timed out. Please try again."
+    if isinstance(exc, SearchConnectionError):
+        return "Could not connect to Serper. Check your connection and try again."
+    if isinstance(exc, SearchResponseError):
+        return "Serper returned an unreadable response. Please try again."
+    raise exc
+
+
+def build_search_key(filters):
+    key_filters = {
+        key: filters.get(key, "")
+        for key in (
+            "role",
+            "country",
+            "state",
+            "city",
+            "org_type",
+            "org_name",
+            "filter_status",
+            "batch_year",
+            "widen_search",
+            "disambiguate",
+            "exclude_words",
+        )
+    }
+    encoded = json.dumps(
+        key_filters, sort_keys=True, ensure_ascii=False, separators=(",", ":")
+    )
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def clean_pool_search_key(value):
+    search_key = str(value or "").strip()
+    if not re.fullmatch(r"[a-f0-9]{64}", search_key):
+        abort(400)
+    return search_key
+
+
+def insert_selected_profiles(connection, selected, batch_id, timestamp):
+    saved = 0
+    skipped = 0
+    for item in selected:
+        if not isinstance(item, dict):
+            abort(400)
+        url = normalize_linkedin_url(item.get("url", ""))
+        if url is None:
+            abort(400)
+        org_type = str(item.get("org_type") or "").lower()
+        if org_type not in ORG_TYPES:
+            org_type = ""
+        existing = connection.execute(
+            "SELECT id FROM people WHERE normalize_linkedin_url(url) = ?",
+            (url,),
+        ).fetchone()
+        if existing:
+            skipped += 1
+            continue
+        cursor = connection.execute(
+            """INSERT OR IGNORE INTO people
+                (name, headline, snippet, url, college, source, status,
+                 org_type, org_name, status_hint, years_text, batch_id,
+                 shortlisted_at, status_changed_at)
+                VALUES (?, ?, ?, ?, '', 'LinkedIn', 'shortlisted',
+                        ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                str(item.get("name") or "LinkedIn profile")[:200],
+                str(item.get("headline") or "")[:500],
+                str(item.get("snippet") or "")[:2000],
+                url[:500],
+                org_type,
+                str(item.get("org_name") or "")[:120],
+                item.get("status_hint")
+                if item.get("status_hint") in ("current", "past", "unclear")
+                else "unclear",
+                str(item.get("years_text") or "")[:40],
+                batch_id,
+                timestamp,
+                timestamp,
+            ),
+        )
+        saved += cursor.rowcount
+        if not cursor.rowcount:
+            skipped += 1
+            continue
+        connection.execute(
+            """INSERT OR IGNORE INTO person_links
+               (person_id, platform, kind, url, title, snippet, handle,
+                confidence, confirmed, dismissed)
+               VALUES (?, 'linkedin', 'profile', ?, ?, ?, '', 'likely', 1, 0)""",
+            (
+                cursor.lastrowid,
+                url,
+                str(item.get("name") or "")[:200],
+                str(item.get("snippet") or "")[:2000],
+            ),
+        )
+        connection.execute(
+            """INSERT INTO status_history
+               (person_id, old_status, new_status, changed_at)
+               VALUES (?, NULL, 'shortlisted', ?)""",
+            (cursor.lastrowid, timestamp),
+        )
+    return saved, skipped
+
+
+def save_search_pool(db_factory, search_key, profiles):
+    if not profiles:
+        return
+    found_at = datetime.now(ZoneInfo("UTC")).isoformat(timespec="seconds")
+    with db_factory() as connection:
+        for profile in profiles:
+            url = normalize_linkedin_url(profile.get("url", ""))
+            if not url:
+                continue
+            connection.execute(
+                """INSERT INTO search_pool (search_key, url, profile_json, found_at)
+                   VALUES (?, ?, ?, ?)
+                   ON CONFLICT(search_key, url) DO UPDATE SET
+                     profile_json = excluded.profile_json,
+                     found_at = excluded.found_at""",
+                (
+                    search_key,
+                    url,
+                    json.dumps(profile, ensure_ascii=False),
+                    found_at,
+                ),
+            )
+
+
+def get_search_pool_summary(db_factory, search_key):
+    with db_factory() as connection:
+        rows = connection.execute(
+            "SELECT url FROM search_pool WHERE search_key = ? ORDER BY id",
+            (search_key,),
+        ).fetchall()
+        existing = {
+            normalize_linkedin_url(row["url"])
+            for row in connection.execute("SELECT url FROM people").fetchall()
+        }
+    saved = sum(
+        1 for row in rows if normalize_linkedin_url(row["url"]) in existing
+    )
+    return {
+        "total": len(rows),
+        "saved": saved,
+        "unsaved": len(rows) - saved,
+        "urls": {normalize_linkedin_url(row["url"]) for row in rows},
+    }
+
+
+def get_next_collect_page(db_factory, query, per_page, pooled_urls):
+    with db_factory() as connection:
+        rows = connection.execute(
+            """SELECT page, results_json FROM search_cache
+               WHERE query = ? AND per_page = ? ORDER BY page""",
+            (query, per_page),
+        ).fetchall()
+    cached_pages = {row["page"]: row["results_json"] for row in rows}
+    for page in range(1, 11):
+        if page not in cached_pages:
+            return page
+        try:
+            items = json.loads(cached_pages[page])
+        except (json.JSONDecodeError, TypeError):
+            items = []
+        if not items:
+            return 11
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            url = normalize_linkedin_url(item.get("link", ""))
+            if url and url not in pooled_urls:
+                return page
+    return 11
+
+
+def get_cached_page_count(db_factory, query, per_page):
+    with db_factory() as connection:
+        return connection.execute(
+            """SELECT COUNT(DISTINCT page) FROM search_cache
+               WHERE query = ? AND per_page = ?""",
+            (query, per_page),
+        ).fetchone()[0]
+
+
+def run_browse_search(
+    query,
+    cache_query,
+    filters,
+    raw_cursor,
+    previous_cursors,
+    show_saved,
+    refresh,
+    gl,
+    db_factory,
+    max_calls=MAX_SERPER_CALLS_PER_SEARCH,
+    max_pages=None,
+    target_count=None,
+    exclude_urls=None,
+):
+    """Fetch cached raw pages until this browse page is filled or bounded."""
+    saved_people = get_saved_people_by_url(db_factory)
+    results = []
+    pool_profiles = []
+    seen_urls = set(exclude_urls or ())
+    counted_saved_urls = set()
+    raw_result_count = 0
+    non_profile_count = 0
+    already_saved_count = 0
+    used_credits = 0
+    cache_hits = 0
+    attempts = 0
+    last_raw_count = 0
+    last_consumed_cursor = raw_cursor - 1
+    api_error = None
+    target_count = filters["per_page"] if target_count is None else target_count
+
+    max_pages = max_calls if max_pages is None else max_pages
+    for offset in range(max_pages):
+        if len(results) >= target_count:
+            break
+        raw_page = raw_cursor + offset
+        if raw_page > 10:
+            break
+        attempts += 1
+        provider_results = None
+        if not (refresh and offset == 0):
+            provider_results = get_cached_results(
+                db_factory, cache_query, raw_page, filters["per_page"]
+            )
+            if provider_results is not None:
+                cache_hits += 1
+        if provider_results is None:
+            if used_credits >= max_calls:
+                break
+            used_credits += 1
+            try:
+                search_kwargs = {"num": filters["per_page"], "page": raw_page}
+                if gl is not None:
+                    search_kwargs["gl"] = gl
+                provider_results = search_web(query, **search_kwargs)
+                save_cached_results(
+                    db_factory, cache_query, raw_page, filters["per_page"], provider_results
+                )
+            except (
+                RuntimeError,
+                SearchAPIError,
+                SearchTimeoutError,
+                SearchConnectionError,
+                SearchResponseError,
+            ) as exc:
+                api_error = search_error_message(exc)
+                break
+
+        last_consumed_cursor = raw_page
+        last_raw_count = len(provider_results)
+        raw_result_count += last_raw_count
+        for item in provider_results:
+            if not isinstance(item, dict):
+                non_profile_count += 1
+                continue
+            normalized_url = normalize_linkedin_url(item.get("link", ""))
+            if normalized_url is None:
+                non_profile_count += 1
+                continue
+            if normalized_url in seen_urls:
+                continue
+            seen_urls.add(normalized_url)
+            shaped = shape_results([item], filters)
+            if not shaped:
+                non_profile_count += 1
+                continue
+            result = shaped[0]
+            saved = saved_people.get(normalized_url)
+            result["saved_person"] = saved
+            if saved:
+                result["shortlist_disabled"] = True
+            pool_profiles.append(result)
+            if saved:
+                if normalized_url not in counted_saved_urls:
+                    already_saved_count += 1
+                    counted_saved_urls.add(normalized_url)
+                result["shortlist_disabled"] = True
+                if not show_saved:
+                    continue
+            result["role_label"] = detect_role(
+                result["headline"], result["snippet"], result["org_name"]
+            )[0]
+            if len(results) < target_count:
+                results.append(result)
+        if len(results) >= target_count or not provider_results or raw_page >= 10:
+            break
+
+    results = results[:filters["per_page"]]
+    next_page = last_raw_count > 0 and last_consumed_cursor < 10
+    history = list(previous_cursors)
+    page_number = len(history) + 1
+    next_history = history + [raw_cursor]
+    cap_reached = (
+        len(results) < filters["per_page"]
+        and last_consumed_cursor >= raw_cursor
+        and attempts >= max_calls
+        and last_consumed_cursor < 10
+        and api_error is None
+    )
+    return {
+        "results": results,
+        "pool_profiles": pool_profiles,
+        "page": page_number,
+        "next_page": next_page,
+        "cached": cache_hits > 0,
+        "api_error": api_error,
+        "already_saved_count": already_saved_count,
+        "raw_page_cursor": raw_cursor,
+        "next_raw_page_cursor": last_consumed_cursor + 1,
+        "previous_cursors": history,
+        "next_previous_cursors": next_history,
+        "raw_result_count": raw_result_count,
+        "non_profile_count": non_profile_count,
+        "used_credits": used_credits,
+        "underfilled": cap_reached,
+    }
 
 
 def get_saved_people_by_url(db_factory):

@@ -1,0 +1,124 @@
+{
+  "states": [
+    {
+      "name": "Abu Dhabi",
+      "cities": [
+        "Abu Dhabi",
+        "Al Ain City",
+        "Musaffah",
+        "Khalifah A City",
+        "Mohammed Bin Zayed City",
+        "Bani Yas City",
+        "Zayed City",
+        "Al Shamkhah City",
+        "Ar Ruways",
+        "Masdar City",
+        "Muzayri'",
+        "Sha'biyyat Al Hiyar",
+        "Shakhbout City",
+        "Suwayhan",
+        "Al Faqaa",
+        "Al Wiqan"
+      ]
+    },
+    {
+      "name": "Ajman",
+      "cities": [
+        "Ajman",
+        "Ar Rumaylah",
+        "Al Hamidiyah",
+        "Al Jurf",
+        "Masfut",
+        "Mushayrif",
+        "Al Manamah"
+      ]
+    },
+    {
+      "name": "Dubai",
+      "cities": [
+        "Dubai",
+        "Dayrah",
+        "Jebel Ali",
+        "Business Bay",
+        "Dubai Investments Park",
+        "Dubai Marina",
+        "International City",
+        "Warisan",
+        "Dubai Silicon Oasis",
+        "Hawr al 'Anz",
+        "Dubai Festival City",
+        "Al Karama",
+        "Mirdif",
+        "Al Warqaa",
+        "Lahbab",
+        "Nayf",
+        "Al Muteena",
+        "Al Qusais 1",
+        "Mankhul",
+        "As Satwah",
+        "Jumayra",
+        "Ar Rashidiyah",
+        "Dubai International Financial Centre",
+        "Al Furjan",
+        "The Palm Jumeirah",
+        "Dubai Internet City",
+        "Al Wasl",
+        "Al Waheda",
+        "Al Murar al Qadim",
+        "Al Bada'a",
+        "Bur Dubai",
+        "Abu Hayl",
+        "Al Mizhar First",
+        "Umm Suqaym",
+        "Al Safa",
+        "Hatta",
+        "Dubai Sports City",
+        "Knowledge Village",
+        "Nadd al Humr",
+        "Downtown Dubai"
+      ]
+    },
+    {
+      "name": "Fujairah",
+      "cities": [
+        "Fujairah",
+        "Reef Al Fujairah City",
+        "Tarif Kalba",
+        "Dibba Al-Fujairah",
+        "Dibba Al-Hisn"
+      ]
+    },
+    {
+      "name": "Ras Al Khaimah",
+      "cities": [
+        "Ras Al Khaimah",
+        "Ar Rams",
+        "Al Jazirah al Hamra'",
+        "Ash Sha'm"
+      ]
+    },
+    {
+      "name": "Sharjah",
+      "cities": [
+        "Sharjah",
+        "Al Majaz",
+        "Al Sajaah",
+        "Khawr Fakkan",
+        "Kalba",
+        "Adh Dhayd",
+        "Halwan",
+        "Al Madam",
+        "Sha'biyyat Milehah",
+        "Al Hamriyah",
+        "Murbah"
+      ]
+    },
+    {
+      "name": "Umm Al Quwain",
+      "cities": [
+        "Umm Al Quwain City",
+        "Al Raafah"
+      ]
+    }
+  ]
+}

@@ -4,20 +4,36 @@
 <section class="page-heading tracker-heading">
   <div>
     <p class="eyebrow">OUTREACH LOG</p>
-    <h1>Tracker</h1>
+    <h1>Outreach <span class="ui-grad">tracker</span></h1>
     <p>Keep your outreach thoughtful and record each status yourself.</p>
   </div>
-  <div class="export-actions">
-    <a class="button button-secondary" href="{{ url_for('export_csv', status=status_filter or None, verified_current='1' if verified_current else None, batch=batch_filter or None, due='1' if due_filter else None) }}">Export CSV</a>
-    <a class="button button-primary" href="{{ url_for('export_xlsx', status=status_filter or None, verified_current='1' if verified_current else None, batch=batch_filter or None, due='1' if due_filter else None) }}">Export Excel</a>
+  <div class="export-actions ui-heading-action">
+    <a class="button button-secondary ui-export-link" href="{{ url_for('export_csv', status=status_filter or None, verified_current='1' if verified_current else None, batch=batch_filter or None, due='1' if due_filter else None) }}">Export CSV</a>
+    <a class="button button-primary ui-export-link" href="{{ url_for('export_xlsx', status=status_filter or None, verified_current='1' if verified_current else None, batch=batch_filter or None, due='1' if due_filter else None) }}">Export Excel</a>
   </div>
+</section>
+<p class="eyebrow ui-section-eyebrow">AT A GLANCE</p>
+{% set summary = namespace(sent=0, connected=0, replied=0, due=0) %}
+{% for person in people %}
+  {% if person.status == 'sent' %}{% set summary.sent = summary.sent + 1 %}{% endif %}
+  {% if person.status == 'connected' %}{% set summary.connected = summary.connected + 1 %}{% endif %}
+  {% if person.status == 'replied' %}{% set summary.replied = summary.replied + 1 %}{% endif %}
+  {% if person.follow_up_date and person.follow_up_date <= nav_today %}{% set summary.due = summary.due + 1 %}{% endif %}
+{% endfor %}
+<section class="ui-stats-grid" aria-label="Tracker summary">
+  <article class="ui-stat-card"><span>Total</span><strong>{{ people|length }}</strong></article>
+  <article class="ui-stat-card"><span title="People you have messaged (includes connected and replied)">Sent</span><strong>{{ tracker_sent_count }}</strong></article>
+  <article class="ui-stat-card"><span>Connected</span><strong>{{ summary.connected }}</strong></article>
+  <article class="ui-stat-card"><span>Replied</span><strong>{{ summary.replied }}</strong></article>
+  <article class="ui-stat-card ui-stat-card-warm"><span>Follow-ups due</span><strong>{{ summary.due }}</strong></article>
 </section>
 <div class="daily-count {% if sent_today > warning_threshold %}daily-count-warning{% endif %}">
   <span class="count-number">{{ sent_today }}</span>
   <span>manually marked sent today</span>
   {% if sent_today > warning_threshold %}<strong>You've passed 10 today. Consider pausing and personalizing your next outreach.</strong>{% else %}<span class="muted">Daily guideline: 10</span>{% endif %}
 </div>
-<form class="filter-row" method="get" action="{{ url_for('tracker') }}">
+<p class="eyebrow ui-section-eyebrow">FILTER RECORDS</p>
+<form class="filter-row ui-filter-toolbar" method="get" action="{{ url_for('tracker') }}">
   <label for="status-filter">Filter by status</label>
   <select id="status-filter" name="status" onchange="this.form.submit()">
     <option value="">All statuses</option>
@@ -34,27 +50,39 @@
   <button class="button button-secondary" type="submit">Apply filters</button>
 </form>
 {% if people %}
-  <div class="card-list">
+  <p class="eyebrow ui-section-eyebrow">PEOPLE</p>
+  <div class="table-wrap ui-tracker-wrap">
+    <table class="ui-tracker-table">
+      <thead><tr><th scope="col">Creator</th><th scope="col">Outreach activity</th><th scope="col">Update tracker</th></tr></thead>
+      <tbody>
     {% for person in people %}
-      <article class="person-card tracker-card">
-        <div class="person-card-heading">
-          <div>
+      <tr class="tracker-card">
+        <td>
+          <div class="person-card-heading">
+            <div class="tracker-creator">
             <a class="profile-name" href="{{ person.url }}" target="_blank" rel="noopener noreferrer">{{ person.name }}</a>
             {% if person.headline %}<p class="profile-headline">{{ person.headline }}</p>{% endif %}
+            </div>
           </div>
-          <span class="status-pill status-{{ person.status }}">{{ person.status|title }}</span>
-        </div>
-        {% if person.org_name %}<span class="tag">{{ person.org_name }}</span><span class="muted small">{{ person.org_type|title }}</span>{% endif %}
-        <p class="muted small">Batch: {{ person.batch_name or 'Earlier outreach' }}{% if person.removed_from_shortlist %} · Removed from shortlist{% endif %}</p>
-        <p class="muted small">Manually verified: {{ person.verified_status|title }}{% if person.verified_note %} · {{ person.verified_note }}{% endif %}</p>
-        <p class="muted small">Added {{ person.created_at[:10] }}{% if person.sent_at %} · Sent {{ person.sent_at[:10] }}{% endif %}{% if person.last_status_changed_at %} · Last status change {{ person.last_status_changed_at }}{% endif %}</p>
-        <p class="muted small">Source: {{ person.source }}{% if person.referred_by %} · Referred by {{ person.referred_by }}{% endif %} · Touches: {{ person.touch_count }}{% if person.follow_up_date %} · Follow-up: {{ person.follow_up_date }}{% endif %}</p>
-        {% if person.last_sent_text %}
-          <details class="last-sent-details">
-            <summary>Last sent message</summary>
-            <p>{{ person.last_sent_text }}</p>
-          </details>
-        {% endif %}
+          {% if person.org_name %}<p class="muted small tracker-organisation">{{ person.org_name }}{% if person.org_type and person.org_type != 'college' %} · {{ person.org_type|title }}{% endif %}</p>{% endif %}
+          <p class="muted small tracker-batch">Batch: {{ person.batch_name or 'Earlier outreach' }}{% if person.removed_from_shortlist %} · Removed from shortlist{% endif %}</p>
+        </td>
+        <td>
+          <dl class="tracker-details">
+            <div><dt>Status</dt><dd><span class="status-pill status-{{ person.status }}">{{ person.status|replace('_', ' ')|title }}</span></dd></div>
+            <div><dt>Verification</dt><dd class="muted small">Manually verified: {{ person.verified_status|title }}{% if person.verified_note %} · {{ person.verified_note }}{% endif %}</dd></div>
+            <div><dt>Dates</dt><dd class="muted small">Added {{ person.created_at[:10] }}{% if person.sent_at %} · Sent {{ person.sent_at[:10] }}{% endif %}{% if person.last_status_changed_at %} · Last status change {{ person.last_status_changed_at }}{% endif %}</dd></div>
+            <div><dt>Touches</dt><dd class="muted small">Source: {{ person.source }}{% if person.referred_by %} · Referred by {{ person.referred_by }}{% endif %} · Touches: {{ person.touch_count }}{% if person.follow_up_date %} · Follow-up: {{ person.follow_up_date }}{% endif %}</dd></div>
+          </dl>
+          {% if person.last_sent_text %}
+            <details class="last-sent-details">
+              <summary>Last sent message</summary>
+              <p>{{ person.last_sent_text }}</p>
+            </details>
+          {% endif %}
+        </td>
+        <td>
+        <div class="tracker-update">
         <form class="tracker-edit" method="post" action="{{ url_for('update_person', person_id=person.id) }}">
           <input type="hidden" name="return_status" value="{{ status_filter }}">
           <input type="hidden" name="return_verified_current" value="{% if verified_current %}1{% endif %}">
@@ -93,10 +121,17 @@
             <button class="button button-secondary" type="submit">Mark connected</button>
           </form>
         {% endif %}
-      </article>
+        </div>
+        </td>
+      </tr>
     {% endfor %}
+      </tbody>
+    </table>
   </div>
 {% else %}
-  <div class="empty-state"><strong>No tracker entries{% if status_filter %} with this status{% endif %}.</strong><p>Profiles you shortlist will appear here.</p><a class="button button-primary" href="{{ url_for('search_page') }}">Find creators</a></div>
+  <div class="empty-state ui-empty-state">
+    <svg aria-hidden="true" viewBox="0 0 96 72" fill="none"><rect x="19" y="12" width="58" height="48" rx="6" stroke="currentColor" stroke-width="4"/><path d="M31 27h34M31 38h34M31 49h20" stroke="currentColor" stroke-width="4" stroke-linecap="round"/></svg>
+    <strong>No tracker entries{% if status_filter %} with this status{% endif %}.</strong><p>Profiles you shortlist will appear here, ready for thoughtful follow-up.</p><a class="button button-primary" href="{{ url_for('search_page') }}">Find creators</a>
+  </div>
 {% endif %}
 {% endblock %}

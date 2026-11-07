@@ -8,8 +8,16 @@ from io import BytesIO
 from pathlib import Path
 from zoneinfo import ZoneInfo
 from unittest.mock import patch
+from werkzeug.datastructures import MultiDict
 
-from app import build_query, create_app, detect_role, normalize_filters
+from app import (
+    build_query,
+    build_search_key,
+    create_app,
+    detect_role,
+    location_cache_key,
+    normalize_filters,
+)
 from database import connect, init_db
 from openpyxl import load_workbook
 from search_provider import (
@@ -94,6 +102,151 @@ class EditorScoutTests(unittest.TestCase):
                 response = self.client.get(path)
                 self.assertEqual(response.status_code, 200)
 
+    def test_primary_pages_render_accessible_active_navigation(self):
+        expected = {
+            "/": rb'href="/" aria-current="page"',
+            "/shortlist": rb'href="/shortlist" aria-current="page"',
+            "/tracker": rb'href="/tracker" aria-current="page"',
+        }
+        for path, active_link in expected.items():
+            with self.subTest(path=path):
+                response = self.client.get(path)
+                self.assertIn(b'<nav class="ui-tabs" aria-label="Main navigation">', response.data)
+                self.assertEqual(
+                    len(re.findall(rb'<a class="ui-tab(?: is-active)?"', response.data)),
+                    3,
+                )
+                self.assertIn(active_link, response.data)
+                self.assertIn(b'Skip to content', response.data)
+                self.assertIn(b'rel="icon" href="data:image/svg+xml,', response.data)
+
+    def test_incubrix_logo_link_and_static_asset(self):
+        response = self.client.get("/")
+        self.assertRegex(
+            response.data,
+            rb'<a class="ui-incubrix-link" href="https://incubrix\.com/" target="_blank" rel="noopener noreferrer">\s*'
+            rb'<img class="ui-incubrix-logo" src="[^"]*/static/img/incubrix-logo\.svg" alt="Incubrix"',
+        )
+        self.assertIn(b'width="180" height="24" loading="eager"', response.data)
+        self.assertIn(b'width="135" height="18" loading="eager"', response.data)
+
+        logo_path = Path(__file__).resolve().parents[1] / "static" / "img" / "incubrix-logo.svg"
+        created_directory = not logo_path.parent.exists()
+        created_file = not logo_path.exists()
+        if created_file:
+            logo_path.parent.mkdir(parents=True, exist_ok=True)
+            logo_path.write_text(
+                '<svg xmlns="http://www.w3.org/2000/svg"><title>Test placeholder</title></svg>',
+                encoding="utf-8",
+            )
+
+        def cleanup_placeholder():
+            if created_file and logo_path.exists():
+                logo_path.unlink()
+            if created_directory and logo_path.parent.exists():
+                logo_path.parent.rmdir()
+
+        self.addCleanup(cleanup_placeholder)
+        asset_response = self.client.get("/static/img/incubrix-logo.svg")
+        self.assertEqual(asset_response.status_code, 200)
+
+    def test_theme_controls_and_css_tokens(self):
+        response = self.client.get("/")
+        self.assertIn(b'data-theme="dark"', response.data)
+        self.assertIn(b'class="ui-theme-select"', response.data)
+
+        css_path = Path(__file__).resolve().parents[1] / "static" / "style.css"
+        css = css_path.read_text(encoding="utf-8")
+        for token in ("--bg: #07090f", "--primary: #2563ff", "--accent: #2dd4bf", "--gradient:"):
+            self.assertIn(token, css)
+
+        depth = 0
+        root_scopes = []
+        outside_root_colors = []
+        for line_number, line in enumerate(css.splitlines(), start=1):
+            if ":root" in line and "{" in line:
+                root_scopes.append(depth + line.count("{") - line.count("}"))
+            in_root_scope = bool(root_scopes and depth >= root_scopes[-1])
+            if re.search(r"#[0-9a-fA-F]{3,8}\b", line) and not in_root_scope:
+                outside_root_colors.append((line_number, line.strip()))
+            depth += line.count("{") - line.count("}")
+            while root_scopes and depth < root_scopes[-1]:
+                root_scopes.pop()
+        self.assertEqual(outside_root_colors, [])
+
+    def test_follow_up_navigation_badge_appears_only_when_due(self):
+        response = self.client.get("/tracker")
+        self.assertNotIn(b'aria-label="1 follow-ups due"', response.data)
+        person_id = self.shortlist_profile("Due Creator", "due-creator")
+        due_date = datetime.now(ZoneInfo("Asia/Kolkata")).date().isoformat()
+        with connect(self.database_path) as connection:
+            connection.execute(
+                "UPDATE people SET follow_up_date = ? WHERE id = ?",
+                (due_date, person_id),
+            )
+        response = self.client.get("/tracker")
+        self.assertIn(b'aria-label="1 follow-ups due"', response.data)
+        self.assertIn(b'class="ui-stat-card ui-stat-card-warm"', response.data)
+
+    def test_tracker_renders_sticky_table_with_existing_edit_fields(self):
+        self.shortlist_profile("Table Creator", "table-creator")
+        response = self.client.get("/tracker")
+        self.assertIn(b'<table class="ui-tracker-table">', response.data)
+        self.assertIn(b'<th scope="col">Creator</th>', response.data)
+        self.assertIn(b'name="status"', response.data)
+        self.assertIn(b'name="personal_note"', response.data)
+        self.assertIn(b'name="follow_up_date"', response.data)
+
+    def test_tracker_sent_stat_includes_people_contacted_in_other_statuses(self):
+        self.shortlist_profile("Sent Stat", "sent-stat", "sent")
+        self.shortlist_profile("Connected Stat", "connected-stat", "connected")
+        self.shortlist_profile("Replied Stat", "replied-stat", "replied")
+        self.shortlist_profile("Agreed Stat", "agreed-stat", "agreed")
+        touched_id = self.shortlist_profile("Touched Stat", "touched-stat", "new")
+        with connect(self.database_path) as connection:
+            connection.execute(
+                "UPDATE people SET touch_count = 1 WHERE id = ?", (touched_id,)
+            )
+
+        response = self.client.get("/tracker")
+        self.assertIn(
+            b'<span title="People you have messaged (includes connected and replied)">Sent</span><strong>5</strong>',
+            response.data,
+        )
+        self.assertIn(b"<span>Connected</span><strong>1</strong>", response.data)
+        self.assertIn(b"<span>Replied</span><strong>1</strong>", response.data)
+
+    def test_tracker_renders_multiple_people_and_nonsticky_table_header(self):
+        self.shortlist_profile("First Tracker Creator", "first-tracker-creator")
+        self.shortlist_profile("Second Tracker Creator", "second-tracker-creator")
+        response = self.client.get("/tracker")
+        self.assertEqual(response.data.count(b"<thead>"), 1)
+        self.assertIn(b"First Tracker Creator", response.data)
+        self.assertIn(b"Second Tracker Creator", response.data)
+
+        css_path = Path(__file__).resolve().parents[1] / "static" / "style.css"
+        css = css_path.read_text(encoding="utf-8")
+        tracker_styles = css[css.index(".ui-tracker-table th"):css.index(".tracker-edit")]
+        self.assertNotIn("position: sticky", tracker_styles)
+
+    def test_flash_messages_render_in_live_toast_container(self):
+        response = self.client.post(
+            "/shortlist",
+            data={
+                "profile": json.dumps(
+                    {
+                        "name": "Toast Creator",
+                        "url": "https://www.linkedin.com/in/toast-creator",
+                    }
+                )
+            },
+            follow_redirects=True,
+        )
+        self.assertIn(b'class="flash-list ui-toast-container" aria-live="polite"', response.data)
+        self.assertIn(b'class="flash flash-success ui-toast" role="status"', response.data)
+        self.assertIn(b'aria-label="Dismiss notification"', response.data)
+        self.assertIn(b'aria-label="1 shortlisted today"', response.data)
+
     def test_build_query_quotes_role_and_excludes_each_term(self):
         query = build_query(
             {
@@ -110,6 +263,174 @@ class EditorScoutTests(unittest.TestCase):
             query,
             'site:linkedin.com/in "video editor" Coimbatore "PSG College" -recruiter -hiring',
         )
+
+    def test_build_query_uses_the_most_specific_location_and_disambiguates(self):
+        base = {
+            "mode": "browse",
+            "role": "video editor",
+            "org_name": "",
+            "filter_status": "any",
+            "exclude_words": "",
+            "widen_search": False,
+        }
+        self.assertIn("Coimbatore", build_query({**base, "city": "Coimbatore"}))
+        self.assertIn('"Tamil Nadu"', build_query({**base, "state": "Tamil Nadu"}))
+        self.assertIn('"United States"', build_query({**base, "country": "US"}))
+        self.assertEqual(
+            build_query({**base, "role": ""}),
+            "site:linkedin.com/in",
+        )
+        custom_city = normalize_filters(MultiDict({
+            "role": "video editor",
+            "city": "Coimbatore",
+            "city_custom": "Pollachi",
+        }))["city"]
+        self.assertIn("Pollachi", build_query({**base, "city": custom_city}))
+        self.assertIn(
+            'Springfield "Illinois"',
+            build_query({
+                **base,
+                "city": "Springfield",
+                "state": "Illinois",
+                "disambiguate": True,
+            }),
+        )
+        self.assertNotIn(
+            '"Illinois"',
+            build_query({
+                **base,
+                "city": "Springfield",
+                "state": "Illinois",
+                "disambiguate": False,
+            }),
+        )
+
+    def test_normalize_location_filters_validates_and_prefers_custom_city(self):
+        with self.assertRaises(ValueError):
+            normalize_filters(MultiDict({"country": "ZZ"}))
+        empty = normalize_filters(MultiDict({"country": "", "role": ""}))
+        self.assertEqual(empty["city"], "")
+        custom = normalize_filters(MultiDict({
+            "country": "IN",
+            "state": "Tamil Nadu",
+            "city": "Coimbatore",
+            "city_custom": "Pollachi",
+            "role": "",
+        }))
+        self.assertEqual(custom["city"], "Pollachi")
+        unsafe = normalize_filters(MultiDict({
+            "city": 'Springfield" (IL) \\',
+            "role": "",
+        }))
+        self.assertEqual(unsafe["city"], "Springfield IL")
+        safe_query = build_query({
+            "mode": "browse",
+            "role": "",
+            "city": unsafe["city"],
+            "org_name": "",
+            "filter_status": "any",
+            "exclude_words": "",
+        })
+        self.assertIn('"Springfield IL"', safe_query)
+        self.assertNotIn('\\"', safe_query)
+        with self.assertRaises(ValueError):
+            normalize_filters(MultiDict({"city": "x" * 81}))
+
+    def test_location_cache_key_includes_country_code(self):
+        base = {
+            "role": "video editor",
+            "city": "Springfield",
+            "state": "",
+            "org_name": "",
+            "filter_status": "any",
+            "exclude_words": "",
+        }
+        from app import location_cache_key
+        self.assertNotEqual(
+            location_cache_key({**base, "country": "US"}),
+            location_cache_key({**base, "country": "CA"}),
+        )
+
+    def test_search_page_has_world_countries_and_default_location(self):
+        response = self.client.get("/")
+        self.assertEqual(response.status_code, 200)
+        self.assertIn(b'option value="IN" selected>India', response.data)
+        self.assertIn(b'data-initial-state="Tamil Nadu"', response.data)
+        self.assertIn(b'data-initial-city="Coimbatore"', response.data)
+        self.assertIn(b'option value="">Anywhere (worldwide)</option>', response.data)
+
+    def test_india_location_file_is_served_and_has_tamil_nadu_cities(self):
+        response = self.client.get("/static/data/locations/IN.json")
+        self.assertEqual(response.status_code, 200)
+        locations = json.loads(response.data)
+        tamil_nadu = next(
+            state for state in locations["states"] if state["name"] == "Tamil Nadu"
+        )
+        self.assertIn("Coimbatore", tamil_nadu["cities"])
+        indian_states = {
+            "Andhra Pradesh", "Arunachal Pradesh", "Assam", "Bihar", "Chhattisgarh",
+            "Goa", "Gujarat", "Haryana", "Himachal Pradesh", "Jharkhand", "Karnataka",
+            "Kerala", "Madhya Pradesh", "Maharashtra", "Manipur", "Meghalaya", "Mizoram",
+            "Nagaland", "Odisha", "Punjab", "Rajasthan", "Sikkim", "Tamil Nadu",
+            "Telangana", "Tripura", "Uttar Pradesh", "Uttarakhand", "West Bengal",
+        }
+        by_name = {state["name"]: state for state in locations["states"]}
+        self.assertTrue(indian_states.issubset(by_name))
+        self.assertTrue(
+            all(len(by_name[name]["cities"]) >= 15 for name in indian_states)
+        )
+
+    @patch("app.search_web")
+    def test_search_location_sets_serper_country_and_rerenders_filters(self, mock_search):
+        mock_search.return_value = []
+        response = self.client.post(
+            "/search",
+            data={
+                "role": "content creator",
+                "country": "US",
+                "state": "",
+                "city": "",
+                "org_type": "",
+                "filter_status": "any",
+                "exclude_words": "recruiter",
+                "per_page": "5",
+            },
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(mock_search.call_args.kwargs["gl"], "us")
+        self.assertIn(b'option value="content creator" selected', response.data)
+        self.assertIn(b'option value="US" selected', response.data)
+        self.assertIn(b'option value="5" selected', response.data)
+        self.assertIn(b"Location: United States", response.data)
+        restored = self.client.get("/")
+        self.assertIn(b'option value="US" selected', restored.data)
+
+    @patch("app.search_web")
+    def test_empty_country_omits_serper_gl(self, mock_search):
+        mock_search.return_value = []
+        response = self.client.post(
+            "/search",
+            data={"role": "video editor", "country": "", "city": ""},
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertNotIn("gl", mock_search.call_args.kwargs)
+
+    @patch("app.search_web")
+    def test_cache_is_separate_for_same_city_in_different_countries(self, mock_search):
+        mock_search.return_value = []
+        for country in ("US", "CA"):
+            response = self.client.post(
+                "/search",
+                data={
+                    "role": "video editor",
+                    "country": country,
+                    "state": "",
+                    "city": "Springfield",
+                    "per_page": "5",
+                },
+            )
+            self.assertEqual(response.status_code, 200)
+        self.assertEqual(mock_search.call_count, 2)
 
     def test_build_query_adds_status_and_type_specific_year_hints(self):
         base = {
@@ -150,13 +471,12 @@ class EditorScoutTests(unittest.TestCase):
 
     @patch("app.search_web")
     def test_search_shows_results_and_passes_page_number(self, mock_search):
-        mock_search.return_value = [
-            {
+        first_page = [{
                 "title": "A Person - Video Editor",
                 "link": "https://www.linkedin.com/in/a-person",
                 "snippet": "Edits short films.",
-            }
-        ]
+            }]
+        mock_search.side_effect = lambda _query, num, page: first_page if page == 2 else []
         response = self.client.post(
             "/search",
             data={
@@ -170,10 +490,15 @@ class EditorScoutTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertIn(b"A Person", response.data)
         self.assertIn(b"Edits short films.", response.data)
-        mock_search.assert_called_once_with(
+        mock_search.assert_any_call(
             'site:linkedin.com/in "video editor" Coimbatore -recruiter',
             num=5,
             page=2,
+        )
+        mock_search.assert_any_call(
+            'site:linkedin.com/in "video editor" Coimbatore -recruiter',
+            num=5,
+            page=3,
         )
 
     @patch("app.search_web")
@@ -229,6 +554,455 @@ class EditorScoutTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertNotIn(b"Saved Person", response.data)
         self.assertIn(b"No new profiles on this page", response.data)
+
+    @patch("app.search_web")
+    def test_search_results_show_shortlist_all_for_selectable_profiles(self, mock_search):
+        saved_url = "https://www.linkedin.com/in/selection-saved"
+        mock_search.return_value = [
+            {"title": "Selectable One", "link": "https://www.linkedin.com/in/selectable-one", "snippet": "Editor"},
+            {"title": "Saved Result", "link": saved_url, "snippet": "Editor"},
+            {"title": "Selectable Two", "link": "https://www.linkedin.com/in/selectable-two", "snippet": "Editor"},
+        ]
+        with connect(self.database_path) as connection:
+            connection.execute(
+                "INSERT INTO people (name, url) VALUES (?, ?)",
+                ("Saved Result", saved_url),
+            )
+        response = self.client.post(
+            "/search",
+            data={
+                "role": "video editor",
+                "city": "Coimbatore",
+                "show_saved": "1",
+                "per_page": "5",
+            },
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertIn(b"This page (2)", response.data)
+        self.assertIn(b"All discovered so far (2)", response.data)
+        self.assertIn(b"0 of 2 selected", response.data)
+        self.assertIn(b'data-selectable-count="2"', response.data)
+        saved_checkbox = re.search(
+            rb'<input class="profile-check"[^>]*aria-label="Shortlist Saved Result"[^>]*>',
+            response.data,
+        )
+        self.assertIsNotNone(saved_checkbox)
+        self.assertIn(b"disabled", saved_checkbox.group(0))
+
+    @patch("app.search_web")
+    def test_pool_tracks_profiles_across_pages_for_all_discovered_scope(self, mock_search):
+        def result_page(page):
+            return [
+                {
+                    "title": f"Pool Person {page}-{index} - Video Editor",
+                    "link": f"https://www.linkedin.com/in/pool-person-{page}-{index}",
+                    "snippet": "Video editor",
+                }
+                for index in range(10)
+            ]
+
+        mock_search.side_effect = lambda _query, num, page, **kwargs: result_page(page)
+        filters = {"role": "video editor", "city": "Coimbatore", "per_page": "10"}
+        first = self.client.post("/search", data=filters)
+        self.assertIn(b"All discovered so far (10)", first.data)
+        next_page = self.client.post(
+            "/search",
+            data={**filters, "raw_page_cursor": "2", "prev_cursors": "1"},
+        )
+        self.assertIn(b"All discovered so far (20)", next_page.data)
+        third_page = self.client.post(
+            "/search",
+            data={**filters, "raw_page_cursor": "3", "prev_cursors": "1,2"},
+        )
+        self.assertIn(b"All discovered so far (30)", third_page.data)
+        with connect(self.database_path) as connection:
+            self.assertEqual(
+                connection.execute("SELECT COUNT(*) FROM search_pool").fetchone()[0],
+                30,
+            )
+
+    def test_shortlist_pool_adds_all_skips_saved_and_is_idempotent(self):
+        search_key = "a" * 64
+        profiles = [
+            {
+                "name": f"Bulk Pool {index}",
+                "url": f"https://www.linkedin.com/in/bulk-pool-{index}",
+                "headline": "Video Editor",
+                "snippet": "Video editing",
+            }
+            for index in range(30)
+        ]
+        with connect(self.database_path) as connection:
+            connection.execute(
+                "INSERT INTO people (name, url) VALUES (?, ?)",
+                ("Existing Pool Profile", profiles[0]["url"]),
+            )
+            for profile in profiles:
+                connection.execute(
+                    """INSERT INTO search_pool
+                       (search_key, url, profile_json, found_at) VALUES (?, ?, ?, ?)""",
+                    (
+                        search_key,
+                        profile["url"],
+                        json.dumps(profile),
+                        "2026-11-07T06:00:00+00:00",
+                    ),
+                )
+        response = self.client.post(
+            "/shortlist/pool",
+            data={"search_key": search_key, "confirm_all": "1"},
+        )
+        self.assertEqual(response.status_code, 302)
+        with connect(self.database_path) as connection:
+            self.assertEqual(
+                connection.execute("SELECT COUNT(*) FROM people").fetchone()[0],
+                30,
+            )
+            self.assertEqual(
+                connection.execute("SELECT COUNT(*) FROM status_history").fetchone()[0],
+                29,
+            )
+        second = self.client.post(
+            "/shortlist/pool",
+            data={"search_key": search_key, "confirm_all": "1"},
+            follow_redirects=True,
+        )
+        self.assertIn(b"Shortlisted 0 profiles (30 already saved, skipped)", second.data)
+
+    def test_shortlist_pool_enforces_200_profile_cap(self):
+        search_key = "b" * 64
+        with connect(self.database_path) as connection:
+            for index in range(230):
+                profile = {
+                    "name": f"Cap Person {index}",
+                    "url": f"https://www.linkedin.com/in/cap-person-{index}",
+                }
+                connection.execute(
+                    """INSERT INTO search_pool
+                       (search_key, url, profile_json, found_at) VALUES (?, ?, ?, ?)""",
+                    (
+                        search_key,
+                        profile["url"],
+                        json.dumps(profile),
+                        "2026-11-07T06:00:00+00:00",
+                    ),
+                )
+        response = self.client.post(
+            "/shortlist/pool",
+            data={"search_key": search_key, "confirm_all": "1"},
+            follow_redirects=True,
+        )
+        self.assertIn(b"Shortlisted 200 profiles", response.data)
+        self.assertIn(b"30 profiles left", response.data)
+        with connect(self.database_path) as connection:
+            self.assertEqual(
+                connection.execute("SELECT COUNT(*) FROM people").fetchone()[0],
+                200,
+            )
+
+    @patch("app.search_web")
+    def test_collect_uses_at_most_five_calls_and_stops_at_fifty(self, mock_search):
+        mock_search.side_effect = lambda _query, num, page, **kwargs: [
+            {
+                "title": f"Collected {page}-{index} - Video Editor",
+                "link": f"https://www.linkedin.com/in/collected-{page}-{index}",
+                "snippet": "Video editor",
+            }
+            for index in range(10)
+        ]
+        filters = {"role": "video editor", "city": "Coimbatore", "per_page": "10"}
+        self.client.post("/search", data=filters)
+        collected = self.client.post(
+            "/search", data={**filters, "collect": "1", "raw_page_cursor": "1"}
+        )
+        self.assertEqual(collected.status_code, 200)
+        self.assertEqual(mock_search.call_count, 5)
+        self.assertIn(b"All discovered so far (50)", collected.data)
+        self.assertIn(b"Collected 40 profiles. Used 4 credits.", collected.data)
+
+    @patch("app.search_web")
+    def test_collect_uses_cached_pages_without_counting_them_as_credits(self, mock_search):
+        mock_search.side_effect = lambda _query, num, page, **kwargs: [
+            {
+                "title": f"Cached Collect {page}-{index} - Video Editor",
+                "link": f"https://www.linkedin.com/in/cached-collect-{page}-{index}",
+                "snippet": "Video editor",
+            }
+            for index in range(10)
+        ]
+        filters = {"role": "video editor", "city": "Coimbatore", "per_page": "10"}
+        self.client.post("/search", data=filters)
+        normalized = normalize_filters(MultiDict(filters))
+        cache_key = location_cache_key(normalized)
+        cached_results = [
+            {
+                "title": f"Cached Collect 2-{index} - Video Editor",
+                "link": f"https://www.linkedin.com/in/cached-collect-2-{index}",
+                "snippet": "Video editor",
+            }
+            for index in range(10)
+        ]
+        with connect(self.database_path) as connection:
+            connection.execute(
+                """INSERT INTO search_cache
+                   (query, page, per_page, results_json, cached_at)
+                   VALUES (?, 2, 10, ?, ?)""",
+                (cache_key, json.dumps(cached_results), datetime.now().timestamp()),
+            )
+
+        collected = self.client.post(
+            "/search", data={**filters, "collect": "1", "raw_page_cursor": "1"}
+        )
+
+        self.assertEqual(mock_search.call_count, 4)
+        self.assertIn(b"All discovered so far (50)", collected.data)
+        self.assertIn(b"Collected 40 profiles. Used 3 credits.", collected.data)
+
+    @patch("app.search_web")
+    def test_collect_keeps_earlier_pages_when_later_page_errors(self, mock_search):
+        def search(_query, num, page, **kwargs):
+            if page == 4:
+                raise SearchAPIError(429)
+            return [
+                {
+                    "title": f"Partial {page}-{index} - Video Editor",
+                    "link": f"https://www.linkedin.com/in/partial-{page}-{index}",
+                    "snippet": "Video editor",
+                }
+                for index in range(10)
+            ]
+
+        mock_search.side_effect = search
+        filters = {"role": "video editor", "city": "Coimbatore", "per_page": "10"}
+        self.client.post("/search", data=filters)
+        collected = self.client.post(
+            "/search", data={**filters, "collect": "1", "raw_page_cursor": "1"}
+        )
+        self.assertIn(b"All discovered so far (30)", collected.data)
+        self.assertIn(b"Serper rate limit reached or search credits exhausted", collected.data)
+        with connect(self.database_path) as connection:
+            self.assertEqual(
+                connection.execute("SELECT COUNT(*) FROM search_pool").fetchone()[0],
+                30,
+            )
+
+    def test_search_key_ignores_page_size_and_changes_with_role_or_location(self):
+        filters = {
+            "role": "video editor",
+            "country": "IN",
+            "state": "Tamil Nadu",
+            "city": "Coimbatore",
+            "org_type": "",
+            "org_name": "",
+            "filter_status": "any",
+            "batch_year": "",
+            "widen_search": False,
+            "disambiguate": False,
+            "exclude_words": "recruiter",
+            "page": 1,
+            "per_page": 5,
+        }
+        self.assertEqual(
+            build_search_key(filters),
+            build_search_key({**filters, "page": 4, "per_page": 10}),
+        )
+        self.assertNotEqual(
+            build_search_key(filters),
+            build_search_key({**filters, "role": "content creator"}),
+        )
+        self.assertNotEqual(
+            build_search_key(filters),
+            build_search_key({**filters, "city": "Chennai"}),
+        )
+
+    def test_pool_expired_rows_are_deleted_on_database_startup(self):
+        search_key = "c" * 64
+        with connect(self.database_path) as connection:
+            connection.execute(
+                """INSERT INTO search_pool
+                   (search_key, url, profile_json, found_at)
+                   VALUES (?, ?, ?, ?)""",
+                (
+                    search_key,
+                    "https://www.linkedin.com/in/expired-pool",
+                    "{}",
+                    "2026-10-01T00:00:00+00:00",
+                ),
+            )
+        init_db(self.database_path)
+        with connect(self.database_path) as connection:
+            self.assertEqual(
+                connection.execute("SELECT COUNT(*) FROM search_pool").fetchone()[0],
+                0,
+            )
+
+    def test_shortlist_post_saves_selected_profiles_once_and_skips_duplicates(self):
+        profiles = [
+            {
+                "name": "Bulk One",
+                "url": "https://www.linkedin.com/in/bulk-one",
+            },
+            {
+                "name": "Bulk Two",
+                "url": "https://www.linkedin.com/in/bulk-two",
+            },
+            {
+                "name": "Bulk One Duplicate",
+                "url": "https://www.linkedin.com/in/bulk-one",
+            },
+        ]
+        response = self.client.post(
+            "/shortlist",
+            data={"profile": [json.dumps(profile) for profile in profiles]},
+        )
+        self.assertEqual(response.status_code, 302)
+        with connect(self.database_path) as connection:
+            rows = connection.execute(
+                "SELECT url, COUNT(*) AS count FROM people GROUP BY url ORDER BY url"
+            ).fetchall()
+        self.assertEqual(len(rows), 2)
+        self.assertTrue(all(row["count"] == 1 for row in rows))
+
+    @patch("app.search_web")
+    def test_browse_backfills_to_requested_usable_count(self, mock_search):
+        first_page = [
+            {"title": f"Article {index}", "link": f"https://example.com/{index}", "snippet": ""}
+            for index in range(6)
+        ]
+        first_page.extend(
+            [
+                {
+                    "title": "Already Saved",
+                    "link": "https://www.linkedin.com/in/already-saved-backfill",
+                    "snippet": "Editor",
+                },
+                *[
+                    {
+                        "title": f"First Page {index} - Video Editor",
+                        "link": f"https://www.linkedin.com/in/first-page-{index}",
+                        "snippet": "Editor",
+                    }
+                    for index in range(3)
+                ],
+            ]
+        )
+        second_page = [
+            {
+                "title": f"Second Page {index} - Video Editor",
+                "link": f"https://www.linkedin.com/in/second-page-{index}",
+                "snippet": "Editor",
+            }
+            for index in range(10)
+        ]
+        mock_search.side_effect = lambda _query, num, page: (
+            first_page if page == 1 else second_page if page == 2 else []
+        )
+        with connect(self.database_path) as connection:
+            connection.execute(
+                "INSERT INTO people (name, url) VALUES (?, ?)",
+                ("Already Saved", "https://www.linkedin.com/in/already-saved-backfill"),
+            )
+
+        response = self.client.post(
+            "/search",
+            data={"role": "video editor", "city": "Coimbatore", "per_page": "5"},
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data.count(b'class="profile-name"'), 5)
+        self.assertIn(b"Serper returned 20 results", response.data)
+        self.assertIn(b"6 were not profile links", response.data)
+        self.assertIn(b"1 already in your shortlist", response.data)
+        self.assertIn(b"showing 5. Used 2 credits", response.data)
+        self.assertEqual(mock_search.call_count, 2)
+
+    @patch("app.search_web")
+    def test_browse_next_is_available_for_short_raw_page(self, mock_search):
+        mock_search.return_value = [
+            {
+                "title": f"Short Page {index} - Video Editor",
+                "link": f"https://www.linkedin.com/in/short-page-{index}",
+                "snippet": "Editor",
+            }
+            for index in range(7)
+        ]
+        response = self.client.post(
+            "/search",
+            data={"role": "video editor", "city": "Coimbatore", "per_page": "5"},
+        )
+        self.assertEqual(response.data.count(b'class="profile-name"'), 5)
+        self.assertIn(b"Next", response.data)
+        self.assertIn(b'name="raw_page_cursor" value="2"', response.data)
+
+    @patch("app.search_web")
+    def test_browse_backfill_respects_three_call_cap(self, mock_search):
+        mock_search.return_value = [
+            {"title": f"Article {i}", "link": f"https://example.com/{i}", "snippet": ""}
+            for i in range(10)
+        ]
+        response = self.client.post(
+            "/search",
+            data={"role": "video editor", "city": "Coimbatore", "per_page": "5"},
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(mock_search.call_count, 3)
+        self.assertIn(b"Only 0 usable profiles found for this search", response.data)
+        self.assertNotIn(b"flash-error", response.data)
+
+    @patch("app.search_web")
+    def test_browse_previous_uses_raw_cursor_history_and_cache(self, mock_search):
+        page_results = {
+            page: [
+                {
+                    "title": f"Page {page} Person {index} - Video Editor",
+                    "link": f"https://www.linkedin.com/in/page-{page}-{index}",
+                    "snippet": "Editor",
+                }
+                for index in range(5)
+            ]
+            for page in (1, 2)
+        }
+        mock_search.side_effect = lambda _query, num, page: page_results.get(page, [])
+        form = {
+            "role": "video editor",
+            "city": "Coimbatore",
+            "per_page": "5",
+        }
+        first = self.client.post("/search", data=form)
+        next_page = self.client.post(
+            "/search",
+            data={**form, "raw_page_cursor": "2", "prev_cursors": "1"},
+        )
+        self.assertIn(b"Page 2", next_page.data)
+        previous = self.client.post(
+            "/search",
+            data={**form, "raw_page_cursor": "1", "prev_cursors": ""},
+        )
+        self.assertIn(b"Page 1", previous.data)
+        self.assertIn(b"Page 1 Person 0", previous.data)
+        self.assertIn(b"Used 0 credits", previous.data)
+        self.assertEqual(mock_search.call_count, 2)
+        self.assertEqual(first.status_code, 200)
+
+    @patch("app.search_web")
+    def test_second_page_error_keeps_first_page_profiles(self, mock_search):
+        first_page = [
+            {
+                "title": f"First Page {index} - Video Editor",
+                "link": f"https://www.linkedin.com/in/error-first-{index}",
+                "snippet": "Editor",
+            }
+            for index in range(2)
+        ]
+        mock_search.side_effect = [first_page, SearchAPIError(429)]
+        response = self.client.post(
+            "/search",
+            data={"role": "video editor", "city": "Coimbatore", "per_page": "5"},
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertIn(b"First Page 0", response.data)
+        self.assertIn(b"First Page 1", response.data)
+        self.assertIn(b"rate limit reached or search credits exhausted", response.data)
+        self.assertEqual(mock_search.call_count, 2)
 
     @patch("app.search_web", side_effect=SearchAPIError(429))
     def test_rate_limit_error_is_explained(self, _mock_search):
@@ -890,7 +1664,7 @@ class EditorScoutTests(unittest.TestCase):
             },
         )
         self.assertIn(b"Saved Visible", response.data)
-        self.assertIn(b"1 already saved shown", response.data)
+        self.assertIn(b"1 already in your shortlist", response.data)
         self.assertIn(b"Already in tracker:", response.data)
         self.assertIn(b'class="profile-check" type="checkbox" name="profile"', response.data)
         self.assertIn(b"disabled", response.data)
@@ -990,23 +1764,25 @@ class EditorScoutTests(unittest.TestCase):
 
     @patch("app.search_web")
     def test_search_results_are_cached_and_refresh_bypasses_cache(self, mock_search):
-        mock_search.return_value = [{
+        first_page = [{
             "title": "Cache Person",
             "link": "https://www.linkedin.com/in/cache-person-123",
             "snippet": "Video editor",
         }]
+        mock_search.side_effect = lambda _query, num, page: first_page if page == 1 else []
         data = {"role": "video editor", "city": "Coimbatore", "per_page": "5"}
         first = self.client.post("/search", data=data)
         second = self.client.post("/search", data=data)
         refreshed = self.client.post("/search", data={**data, "refresh": "1"})
         self.assertEqual(first.status_code, 200)
         self.assertIn(b"Cached result", second.data)
-        self.assertEqual(mock_search.call_count, 2)
+        self.assertIn(b"Used 0 credits", second.data)
+        self.assertEqual(mock_search.call_count, 3)
         self.assertEqual(refreshed.status_code, 200)
         with connect(self.database_path) as connection:
             self.assertEqual(
                 connection.execute("SELECT COUNT(*) FROM search_cache").fetchone()[0],
-                1,
+                2,
             )
 
     def test_status_changes_are_logged_and_sent_timestamp_uses_ist(self):

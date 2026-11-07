@@ -1,34 +1,78 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" data-theme="dark">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#07090f">
   <title>{% block title %}EditorScout{% endblock %}</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Cdefs%3E%3ClinearGradient id='g' x1='0' y1='0' x2='1' y2='1'%3E%3Cstop stop-color='%235b8cff'/%3E%3Cstop offset='1' stop-color='%232dd4bf'/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect width='64' height='64' rx='16' fill='url(%23g)'/%3E%3Ctext x='32' y='45' text-anchor='middle' font-family='Arial,sans-serif' font-size='42' font-weight='700' fill='%23ffffff'%3EE%3C/text%3E%3C/svg%3E">
   <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
   <script src="{{ url_for('static', filename='app.js') }}" defer></script>
 </head>
 <body>
-  <header class="site-header">
-    <a class="brand" href="{{ url_for('search_page') }}"><span class="brand-mark">E</span> EditorScout</a>
-    <nav aria-label="Main navigation">
-      <a href="{{ url_for('search_page') }}">Discover</a>
-      <a href="{{ url_for('shortlist_page') }}">Shortlist</a>
-      <a href="{{ url_for('tracker') }}">Tracker</a>
-    </nav>
+  <a class="ui-skip-link" href="#main-content">Skip to content</a>
+  <header class="site-header ui-header">
+    <div class="ui-header-inner">
+      <div class="ui-brand-group">
+        <a class="brand ui-brand" href="{{ url_for('search_page') }}">
+          <span class="brand-mark ui-brand-mark" aria-hidden="true">E</span>
+          <span>EditorScout</span>
+        </a>
+        <span class="ui-brand-divider" aria-hidden="true"></span>
+        <a class="ui-incubrix-link" href="https://incubrix.com/" target="_blank" rel="noopener noreferrer">
+          <img class="ui-incubrix-logo" src="{{ url_for('static', filename='img/incubrix-logo.svg') }}" alt="Incubrix" width="180" height="24" loading="eager" onerror="this.hidden=true;this.nextElementSibling.hidden=false">
+          <span class="ui-incubrix-fallback" hidden>Incubrix</span>
+        </a>
+      </div>
+      <nav class="ui-tabs" aria-label="Main navigation">
+        <a class="ui-tab{% if request.endpoint in ('search_page', 'search') %} is-active{% endif %}" href="{{ url_for('search_page') }}"{% if request.endpoint in ('search_page', 'search') %} aria-current="page"{% endif %}>
+          <svg aria-hidden="true" viewBox="0 0 20 20" fill="none"><circle cx="8.5" cy="8.5" r="5.5" stroke="currentColor" stroke-width="1.8"/><path d="m13 13 4 4" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
+          <span>Discover</span>
+        </a>
+        <a class="ui-tab{% if request.endpoint in ('shortlist_page', 'shortlist', 'shortlist_pool', 'clear_search_pool', 'shortlist_messages', 'start_new_batch', 'find_more_links', 'confirm_person_link', 'dismiss_person_link', 'remove_from_shortlist', 'save_person', 'generate_draft', 'save_draft', 'reset_shortlist_draft', 'mark_message_sent') %} is-active{% endif %}" href="{{ url_for('shortlist_page') }}"{% if request.endpoint in ('shortlist_page', 'shortlist', 'shortlist_pool', 'clear_search_pool', 'shortlist_messages', 'start_new_batch', 'find_more_links', 'confirm_person_link', 'dismiss_person_link', 'remove_from_shortlist', 'save_person', 'generate_draft', 'save_draft', 'reset_shortlist_draft', 'mark_message_sent') %} aria-current="page"{% endif %}>
+          <svg aria-hidden="true" viewBox="0 0 20 20" fill="none"><path d="M5 3.5h10a1 1 0 0 1 1 1v12l-6-3.5-6 3.5v-12a1 1 0 0 1 1-1Z" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/></svg>
+          <span>Shortlist</span>
+          {% if nav_shortlist_count %}<span class="ui-tab-badge" aria-label="{{ nav_shortlist_count }} shortlisted today">{{ nav_shortlist_count }}</span>{% endif %}
+        </a>
+        <a class="ui-tab{% if request.endpoint in ('tracker', 'update_person', 'export_csv', 'export_xlsx') %} is-active{% endif %}" href="{{ url_for('tracker') }}"{% if request.endpoint in ('tracker', 'update_person', 'export_csv', 'export_xlsx') %} aria-current="page"{% endif %}>
+          <svg aria-hidden="true" viewBox="0 0 20 20" fill="none"><path d="M4 4.5h12M4 9.5h12M4 14.5h7" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/><circle cx="15.5" cy="14.5" r="2.5" stroke="currentColor" stroke-width="1.5"/></svg>
+          <span>Tracker</span>
+          {% if nav_follow_up_count %}<span class="ui-tab-badge ui-tab-badge-warm" aria-label="{{ nav_follow_up_count }} follow-ups due">{{ nav_follow_up_count }}</span>{% endif %}
+        </a>
+      </nav>
+      <label class="ui-theme-control">
+        <span class="visually-hidden">Color theme</span>
+        <select class="ui-theme-select" aria-label="Color theme">
+          <option value="auto">Auto</option>
+          <option value="dark">Dark</option>
+          <option value="light">Light</option>
+        </select>
+      </label>
+    </div>
   </header>
-  <main class="page-shell">
-    <div class="manual-note"><strong>Manual outreach only.</strong> Review every profile yourself before contact. EditorScout only uses Serper search metadata; it never fetches platform pages, logs in, scrapes profiles, or sends messages.</div>
+  <main class="page-shell" id="main-content" tabindex="-1">
+    <div class="manual-note ui-manual-note"><strong>Manual outreach only.</strong> Review every profile yourself before contact. EditorScout only uses Serper search metadata; it never fetches platform pages, logs in, scrapes profiles, or sends messages.</div>
     {% with messages = get_flashed_messages(with_categories=true) %}
       {% if messages %}
-        <div class="flash-list" aria-live="polite">
+        <div class="flash-list ui-toast-container" aria-live="polite" aria-label="Notifications">
           {% for category, message in messages %}
-            <div class="flash flash-{{ category }}">{{ message }}</div>
+            <div class="flash flash-{{ category }} ui-toast" role="{% if category == 'error' %}alert{% else %}status{% endif %}">
+              <span>{{ message }}</span>
+              <button class="ui-toast-dismiss" type="button" aria-label="Dismiss notification">×</button>
+            </div>
           {% endfor %}
         </div>
       {% endif %}
     {% endwith %}
     {% block content %}{% endblock %}
   </main>
-  <footer>EditorScout <span>·</span> Find thoughtfully. Reach out personally.</footer>
+  <footer class="ui-footer">
+    <span class="ui-footer-brand">EditorScout</span>
+    <span class="ui-incubrix-footer">
+      <img class="ui-incubrix-logo" src="{{ url_for('static', filename='img/incubrix-logo.svg') }}" alt="Incubrix" width="135" height="18" loading="eager" onerror="this.hidden=true;this.nextElementSibling.hidden=false">
+      <span class="ui-incubrix-fallback" hidden>Incubrix</span>
+    </span>
+    <span class="ui-footer-copy">Built for the Incubrix creator outreach task · Manual outreach only.</span>
+  </footer>
 </body>
 </html>

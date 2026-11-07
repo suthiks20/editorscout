@@ -1,4 +1,58 @@
 document.addEventListener("DOMContentLoaded", () => {
+  const themeSelect = document.querySelector(".ui-theme-select");
+  if (themeSelect) {
+    let savedTheme = "dark";
+    try {
+      savedTheme = window.localStorage.getItem("editorscout-theme") || "dark";
+    } catch {
+      savedTheme = "dark";
+    }
+    if (!["auto", "light", "dark"].includes(savedTheme)) savedTheme = "dark";
+    themeSelect.value = savedTheme;
+    const applyTheme = (theme) => {
+      if (theme === "auto") document.documentElement.removeAttribute("data-theme");
+      else document.documentElement.dataset.theme = theme;
+      const themeColor = document.querySelector('meta[name="theme-color"]');
+      const autoDark = window.matchMedia("(prefers-color-scheme: dark)").matches;
+      if (themeColor) {
+        themeColor.content = theme === "dark" || (theme === "auto" && autoDark)
+          ? "#07090f"
+          : "#f5f7fb";
+      }
+    };
+    applyTheme(savedTheme);
+    themeSelect.addEventListener("change", () => {
+      const theme = themeSelect.value;
+      applyTheme(theme);
+      try {
+        window.localStorage.setItem("editorscout-theme", theme);
+      } catch {
+        // The selected theme remains active for this page if storage is unavailable.
+      }
+    });
+  }
+
+  document.querySelectorAll(".ui-avatar").forEach((avatar) => {
+    const name = avatar.closest("td")?.querySelector(".profile-name")?.textContent
+      || avatar.closest(".platform-result-card")?.querySelector("strong")?.textContent
+      || avatar.textContent;
+    let hash = 0;
+    for (const character of name.trim().toLowerCase()) {
+      hash = (hash * 31 + character.charCodeAt(0)) | 0;
+    }
+    avatar.classList.add(`ui-avatar-tone-${Math.abs(hash) % 6}`);
+  });
+
+  document.querySelectorAll(".ui-toast").forEach((toast) => {
+    const dismiss = () => {
+      toast.remove();
+    };
+    toast.querySelector(".ui-toast-dismiss")?.addEventListener("click", dismiss);
+    if (toast.getAttribute("role") !== "alert") {
+      window.setTimeout(dismiss, 6000);
+    }
+  });
+
   const orgType = document.getElementById("org-type");
   const orgNameField = document.getElementById("org-name-field");
   const orgName = document.getElementById("org-name");
@@ -10,7 +64,156 @@ document.addEventListener("DOMContentLoaded", () => {
   const platformFields = document.getElementById("platform-fields");
   const modeInputs = document.querySelectorAll('input[name="mode"]');
   const roleInput = document.getElementById("role-input");
-  const cityInput = document.getElementById("city-input");
+  const widenSearchField = document.getElementById("widen-search-field");
+  const searchCreditEstimate = document.getElementById("search-credit-estimate");
+  const locationRoot = document.getElementById("location-controls");
+  const countrySelect = document.getElementById("loc-country");
+  const stateSelect = document.getElementById("loc-state");
+  const stateCustom = document.getElementById("loc-state-custom");
+  const citySelect = document.getElementById("loc-city");
+  const cityCustom = document.getElementById("loc-city-custom");
+  const stateHelp = document.getElementById("loc-state-help");
+  const cityHelp = document.getElementById("loc-city-help");
+  const noLocationData = document.getElementById("loc-no-data");
+  const locationCache = new Map();
+
+  const setCustomInput = (input, visible, value = "") => {
+    input.hidden = !visible;
+    input.disabled = !visible;
+    if (!visible) input.value = "";
+    if (visible && value) input.value = value;
+  };
+  const resetSelect = (select, placeholder) => {
+    select.replaceChildren(new Option(placeholder, ""));
+  };
+  const loadCityOptions = (location, selectedCity = "", selectedCustom = "") => {
+    resetSelect(citySelect, "Any city");
+    const region = location.states.find((item) => item.name === stateSelect.value);
+    if (!region) {
+      citySelect.disabled = true;
+      setCustomInput(cityCustom, false);
+      cityHelp.textContent = "Choose a state or region first.";
+      return;
+    }
+    region.cities.forEach((name) => citySelect.add(new Option(name, name)));
+    citySelect.add(new Option("Other city (type it)", "__other__"));
+    citySelect.disabled = false;
+    citySelect.hidden = false;
+    const hasCity = region.cities.includes(selectedCity);
+    citySelect.value = selectedCustom || (selectedCity && !hasCity) ? "__other__" : selectedCity;
+    const customChosen = citySelect.value === "__other__";
+    setCustomInput(
+      cityCustom,
+      customChosen,
+      selectedCustom || (customChosen ? selectedCity : "")
+    );
+    cityHelp.textContent = "Choose a city, or select Other city to type one.";
+  };
+  const loadLocationOptions = async (countryCode, selectedState = "", selectedCity = "", selectedStateCustom = "", selectedCityCustom = "") => {
+    stateSelect.onchange = null;
+    citySelect.onchange = null;
+    resetSelect(stateSelect, "Any state / region");
+    resetSelect(citySelect, "Any city");
+    setCustomInput(stateCustom, false);
+    setCustomInput(cityCustom, false);
+    noLocationData.hidden = true;
+    if (!countryCode) {
+      stateSelect.disabled = true;
+      citySelect.disabled = true;
+      stateHelp.textContent = "Choose a country first.";
+      cityHelp.textContent = "Choose a state or region first.";
+      return;
+    }
+
+    noLocationData.textContent = "No city list for this country yet. Type the city or region yourself.";
+    let location = locationCache.get(countryCode);
+    if (!locationCache.has(countryCode)) {
+      try {
+        const response = await fetch(`/static/data/locations/${encodeURIComponent(countryCode)}.json`);
+        if (response.status === 404) {
+          location = null;
+          locationCache.set(countryCode, null);
+        } else if (!response.ok) {
+          throw new Error(`Location list request failed (${response.status}).`);
+        } else {
+          location = await response.json();
+          if (!location || !Array.isArray(location.states)) {
+            throw new Error("Location list has an invalid format.");
+          }
+          locationCache.set(countryCode, location);
+        }
+      } catch (error) {
+        noLocationData.textContent = `${error.message} You can still type the location.`;
+        location = null;
+      }
+    }
+    if (countrySelect.value !== countryCode) return;
+    if (!location) {
+      stateSelect.disabled = true;
+      stateSelect.hidden = true;
+      citySelect.disabled = true;
+      citySelect.hidden = true;
+      setCustomInput(stateCustom, true, selectedStateCustom || selectedState);
+      setCustomInput(cityCustom, true, selectedCityCustom || selectedCity);
+      noLocationData.hidden = false;
+      stateHelp.textContent = "Type a state or region if helpful.";
+      cityHelp.textContent = "Type a city if helpful.";
+      return;
+    }
+
+    stateSelect.hidden = false;
+    citySelect.hidden = false;
+    location.states.forEach((item) => stateSelect.add(new Option(item.name, item.name)));
+    stateSelect.add(new Option("Other state / region (type it)", "__other__"));
+    stateSelect.disabled = false;
+    const stateExists = location.states.some((item) => item.name === selectedState);
+    if (selectedStateCustom || (selectedState && !stateExists)) {
+      stateSelect.value = "__other__";
+      setCustomInput(stateCustom, true, selectedStateCustom || selectedState);
+      citySelect.disabled = true;
+      citySelect.hidden = true;
+      setCustomInput(cityCustom, true, selectedCityCustom || selectedCity);
+      cityHelp.textContent = "Type a city for this region.";
+    } else {
+      stateSelect.value = stateExists ? selectedState : "";
+      stateHelp.textContent = "Choose a state or region.";
+      loadCityOptions(location, selectedCity, selectedCityCustom);
+    }
+
+    stateSelect.onchange = () => {
+      setCustomInput(stateCustom, stateSelect.value === "__other__");
+      if (stateSelect.value === "__other__") {
+        citySelect.disabled = true;
+        citySelect.hidden = true;
+        cityCustom.value = "";
+        setCustomInput(cityCustom, true);
+        cityHelp.textContent = "Type a city for this region.";
+      } else {
+        citySelect.hidden = false;
+        setCustomInput(cityCustom, false);
+        loadCityOptions(location);
+      }
+    };
+    citySelect.onchange = () => {
+      const customChosen = citySelect.value === "__other__";
+      setCustomInput(cityCustom, customChosen);
+      if (customChosen) cityHelp.textContent = "Type the city name.";
+    };
+  };
+  if (locationRoot && countrySelect) {
+    const initialState = locationRoot.dataset.initialState || "";
+    const initialCity = locationRoot.dataset.initialCity || "";
+    loadLocationOptions(
+      countrySelect.value,
+      initialState,
+      initialCity,
+      locationRoot.dataset.initialStateCustom || "",
+      locationRoot.dataset.initialCityCustom || ""
+    );
+    countrySelect.addEventListener("change", () => {
+      loadLocationOptions(countrySelect.value);
+    });
+  }
 
   const updateOrganisationFields = () => {
     if (orgType && orgNameField && orgName && orgNameLabel) {
@@ -49,10 +252,15 @@ document.addEventListener("DOMContentLoaded", () => {
       if (input) input.disabled = mode !== "person";
     }
     if (platformFields) platformFields.hidden = mode !== "person";
+    if (widenSearchField) {
+      widenSearchField.hidden = mode !== "browse";
+      const input = widenSearchField.querySelector("input");
+      if (input) input.disabled = mode !== "browse";
+    }
+    if (searchCreditEstimate) searchCreditEstimate.hidden = mode !== "browse";
     if (roleInput) {
       roleInput.required = mode === "browse";
     }
-    if (cityInput) cityInput.required = mode === "browse";
     const excludeField = document.getElementById("exclude-field");
     const excludeInput = excludeField?.querySelector("input");
     if (excludeInput && mode === "person" && excludeInput.value === "recruiter, hiring, HR, agency") {
@@ -80,7 +288,13 @@ document.addEventListener("DOMContentLoaded", () => {
 
   document.querySelectorAll("[data-confirm]").forEach((form) => {
     form.addEventListener("submit", (event) => {
-      if (!window.confirm(form.dataset.confirm)) event.preventDefault();
+      if (!form.dataset.confirm) return;
+      if (!window.confirm(form.dataset.confirm)) {
+        event.preventDefault();
+        return;
+      }
+      const confirmation = form.querySelector('input[name="confirm_all"]');
+      if (confirmation) confirmation.value = "1";
     });
   });
 
@@ -438,6 +652,93 @@ document.addEventListener("DOMContentLoaded", () => {
       }
     });
   });
+  const shortlistForm = document.getElementById("shortlist-results-form");
+  if (shortlistForm) {
+    const selectable = [...shortlistForm.querySelectorAll(
+      '.results-table input[name="profile"]:not(:disabled)'
+    )];
+    const headerToggle = shortlistForm.querySelector("[data-select-page-results]");
+    const submit = shortlistForm.querySelector("[data-selection-submit]");
+    const countLabels = document.querySelectorAll("[data-selected-count]");
+    const scopeOptions = document.querySelectorAll('input[name="selection_scope"]');
+    const scopeFieldset = document.querySelector(".pool-scope");
+    const total = selectable.length;
+    const poolTotal = Number(scopeFieldset?.dataset.poolCount || 0);
+    const poolUrl = shortlistForm.dataset.poolUrl;
+    const setScope = () => {
+      const poolScope = document.querySelector('input[name="selection_scope"]:checked')?.value === "pool";
+      if (poolScope) {
+        selectable.forEach((checkbox) => {
+          checkbox.checked = true;
+          checkbox.disabled = true;
+        });
+        if (headerToggle) {
+          headerToggle.checked = total > 0;
+          headerToggle.disabled = true;
+          headerToggle.indeterminate = false;
+        }
+        shortlistForm.action = poolUrl;
+        shortlistForm.dataset.confirm =
+          `Add all ${poolTotal} discovered profiles to your shortlist? Open each profile to check it before you contact anyone.`;
+        countLabels.forEach((label) => {
+          label.textContent = `${poolTotal} discovered profiles selected`;
+        });
+        if (submit) {
+          submit.disabled = poolTotal === 0;
+          submit.textContent = `Add all ${poolTotal} to shortlist`;
+        }
+        return;
+      }
+      selectable.forEach((checkbox) => {
+        checkbox.disabled = false;
+      });
+      if (headerToggle) headerToggle.disabled = false;
+      shortlistForm.action = shortlistForm.dataset.pageUrl;
+      updateSelection();
+    };
+    const updateSelection = () => {
+      const selected = selectable.filter((checkbox) => checkbox.checked).length;
+      const allSelected = total > 0 && selected === total;
+      const someSelected = selected > 0 && !allSelected;
+      [headerToggle].forEach((checkbox) => {
+        if (!checkbox || checkbox.disabled) return;
+        checkbox.checked = allSelected;
+        checkbox.indeterminate = someSelected;
+      });
+      countLabels.forEach((label) => {
+        label.textContent = `${selected} of ${total} selected`;
+      });
+      if (submit) {
+        submit.disabled = selected === 0;
+        submit.textContent = allSelected
+          ? `Add all ${total} to shortlist`
+          : "Add selected to shortlist";
+      }
+      if (allSelected) {
+        shortlistForm.dataset.confirm =
+          `Add all ${total} profiles to your shortlist? Open each profile to check it before you contact anyone.`;
+      } else {
+        shortlistForm.dataset.confirm = "";
+      }
+      const confirmation = shortlistForm.querySelector('input[name="confirm_all"]');
+      if (confirmation) confirmation.value = "0";
+    };
+    const setAll = (checked) => {
+      selectable.forEach((checkbox) => {
+        checkbox.checked = checked;
+      });
+      updateSelection();
+    };
+    headerToggle?.addEventListener("change", () => setAll(headerToggle.checked));
+    scopeOptions.forEach((radio) => {
+      radio.addEventListener("change", setScope);
+    });
+    selectable.forEach((checkbox) => {
+      checkbox.addEventListener("change", updateSelection);
+    });
+    shortlistForm.dataset.pageUrl = shortlistForm.action;
+    updateSelection();
+  }
   document.querySelectorAll("[data-select-people]").forEach((button) => {
     button.addEventListener("click", () => {
       const checked = button.dataset.selectPeople === "all";
@@ -535,6 +836,39 @@ document.addEventListener("DOMContentLoaded", () => {
       window.setTimeout(() => {
         button.textContent = originalLabel;
       }, 1800);
+    });
+  });
+
+  const showWorking = (button) => {
+    if (!button || button.disabled || button.classList.contains("is-working")) return;
+    button.classList.add("is-working");
+    button.disabled = true;
+    const spinner = document.createElement("span");
+    spinner.className = "ui-spinner";
+    spinner.setAttribute("aria-hidden", "true");
+    button.replaceChildren(spinner, document.createTextNode("Working..."));
+  };
+  document.querySelectorAll(".search-form, .pool-collect-form, #common-message-form").forEach((form) => {
+    form.addEventListener("submit", (event) => {
+      if (event.defaultPrevented) return;
+      const submitter = event.submitter;
+      if (!submitter) return;
+      const isSearch = form.matches(".search-form, .pool-collect-form");
+      const isGenerate = form.id === "common-message-form"
+        && submitter.name === "action"
+        && submitter.value === "generate";
+      if (isSearch || isGenerate) showWorking(submitter);
+    });
+  });
+  document.querySelectorAll(".ui-export-link").forEach((link) => {
+    link.addEventListener("click", () => {
+      if (link.classList.contains("is-working")) return;
+      link.classList.add("is-working");
+      link.setAttribute("aria-disabled", "true");
+      const spinner = document.createElement("span");
+      spinner.className = "ui-spinner";
+      spinner.setAttribute("aria-hidden", "true");
+      link.replaceChildren(spinner, document.createTextNode("Working..."));
     });
   });
 });

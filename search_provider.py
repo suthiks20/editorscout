@@ -21,7 +21,7 @@ class SearchResponseError(Exception):
     pass
 
 
-def search_web(query, num=10, page=1):
+def search_web(query, num=10, page=1, gl=None):
     """Return organic results as dictionaries containing title, link, and snippet."""
     if not Config.SERPER_API_KEY:
         raise RuntimeError("Add SERPER_API_KEY to your .env file to search.")
@@ -33,7 +33,12 @@ def search_web(query, num=10, page=1):
                 "X-API-KEY": Config.SERPER_API_KEY,
                 "Content-Type": "application/json",
             },
-            json={"q": query, "num": max(1, min(int(num), 10)), "page": page, "gl": "in"},
+            json={
+                "q": query,
+                "num": max(1, min(int(num), 10)),
+                "page": page,
+                **({"gl": gl.lower()} if gl else {}),
+            },
             timeout=Config.SERPER_TIMEOUT_SECONDS,
         )
     except requests.Timeout as exc:
@@ -68,7 +73,7 @@ def search_web(query, num=10, page=1):
     return results
 
 
-def search_videos(query, num=10):
+def search_videos(query, num=10, gl=None):
     """Return Serper video results with a consistent title/link/snippet shape."""
     if not Config.SERPER_API_KEY:
         raise RuntimeError("Add SERPER_API_KEY to your .env file to search.")
@@ -80,7 +85,11 @@ def search_videos(query, num=10):
                 "X-API-KEY": Config.SERPER_API_KEY,
                 "Content-Type": "application/json",
             },
-            json={"q": query, "num": max(1, min(int(num), 10)), "gl": "in"},
+            json={
+                "q": query,
+                "num": max(1, min(int(num), 10)),
+                **({"gl": gl.lower()} if gl else {}),
+            },
             timeout=Config.SERPER_TIMEOUT_SECONDS,
         )
     except requests.Timeout as exc:

@@ -6,7 +6,7 @@
 {%- endmacro %}
 <section class="page-heading">
   <p class="eyebrow">YOUR PICKS</p>
-  <h1>Shortlist</h1>
+  <h1>Your <span class="ui-grad">shortlist</span></h1>
   <p>Prepare your message here. Copy it, send it yourself, then mark it as sent.</p>
   <p class="muted">{% if batch %}Current batch: <strong>{{ batch.name }}</strong>{% else %}No current batch yet{% endif %}</p>
   <p class="muted"><strong>{{ total_shortlisted }} shortlisted in total</strong>{% if selected_date %} · showing {{ person_count }} on {{ selected_date_label }}{% endif %}</p>
@@ -16,8 +16,18 @@
   </form>
 </section>
 
+{% if date_log %}
+  <nav class="ui-date-strip" aria-label="Shortlist dates">
+    <a class="ui-date-chip{% if not selected_date %} is-selected{% endif %}" href="{{ url_for('shortlist_page') }}"><strong>All dates</strong><span>{{ total_shortlisted }}</span></a>
+    {% for group in date_log %}
+      <a class="ui-date-chip{% if selected_date == group.date %} is-selected{% endif %}" href="{{ url_for('shortlist_page', date=group.date) }}"><strong>{{ group.label }}</strong><span>{{ group.count }} picks</span></a>
+    {% endfor %}
+  </nav>
+{% endif %}
+
 {% if not selected_date %}
   <section class="date-log">
+    <p class="eyebrow">OUTREACH HISTORY</p>
     <h2>Pick a date</h2>
     {% if date_log %}
       <div class="date-groups">
@@ -37,7 +47,10 @@
         {% endfor %}
       </div>
     {% else %}
-      <p class="empty-state">Nobody has been shortlisted yet.</p>
+      <div class="empty-state ui-empty-state">
+        <svg aria-hidden="true" viewBox="0 0 96 72" fill="none"><path d="M25 14h46a4 4 0 0 1 4 4v44l-27-15-27 15V18a4 4 0 0 1 4-4Z" stroke="currentColor" stroke-width="4" stroke-linejoin="round"/><path d="M38 31h20" stroke="currentColor" stroke-width="4" stroke-linecap="round"/></svg>
+        <strong>Nobody has been shortlisted yet.</strong><p>Start by finding a creator whose work you like.</p><a class="button button-primary" href="{{ url_for('search_page') }}">Discover creators</a>
+      </div>
     {% endif %}
   </section>
 {% else %}
@@ -49,6 +62,7 @@
 </div>
 
 <section class="panel common-message-panel">
+  <p class="eyebrow">MESSAGE WORKSPACE</p>
   <h2>Common message</h2>
   <form id="common-message-form" method="post" action="{{ url_for('shortlist_messages') }}">
     {{ shortlist_date_input() }}
@@ -294,7 +308,10 @@
         <section id="tabpanel-{{ person.id }}-draft" role="tabpanel" aria-labelledby="tab-{{ person.id }}-draft" data-person-tabpanel="draft">
           <section class="person-draft">
             <div class="person-draft-heading">
-              <h3>Connection note</h3>
+              <div class="ui-heading-stack">
+                <p class="eyebrow">CONNECTION MESSAGE</p>
+                <h3>Connection note</h3>
+              </div>
               {% if draft and draft.is_edited %}<span class="edited-badge">Edited</span>{% endif %}
             </div>
             <form method="post" action="{{ url_for('save_draft', person_id=person.id) }}" id="draft-form-{{ person.id }}-connection">
@@ -322,7 +339,10 @@
             {% set draft = person.drafts.get('follow_up') %}
             <section class="person-draft">
               <div class="person-draft-heading">
-                <h3>Follow-up</h3>
+                <div class="ui-heading-stack">
+                  <p class="eyebrow">AFTER CONNECTING</p>
+                  <h3>Follow-up</h3>
+                </div>
                 {% if draft and draft.is_edited %}<span class="edited-badge">Edited</span>{% endif %}
               </div>
               <form method="post" action="{{ url_for('save_draft', person_id=person.id) }}" id="draft-form-{{ person.id }}-follow_up">
@@ -375,7 +395,7 @@
           </form>
           <form method="post" action="{{ url_for('remove_from_shortlist', person_id=person.id) }}">
             {{ shortlist_date_input() }}
-            <button class="button button-secondary" type="submit">Remove from shortlist</button>
+            <button class="button button-secondary ui-button-danger" type="submit">Remove from shortlist</button>
           </form>
         </footer>
         </div>
@@ -383,7 +403,10 @@
     {% endfor %}
   </div>
 {% else %}
-  <div class="empty-state"><strong>Nobody shortlisted on {{ selected_date_label }}</strong><p>Choose another date or add profiles from Discover.</p><a class="button button-primary" href="{{ url_for('search_page') }}">Find creators</a></div>
+  <div class="empty-state ui-empty-state">
+    <svg aria-hidden="true" viewBox="0 0 96 72" fill="none"><path d="M25 14h46a4 4 0 0 1 4 4v44l-27-15-27 15V18a4 4 0 0 1 4-4Z" stroke="currentColor" stroke-width="4" stroke-linejoin="round"/><path d="M38 31h20" stroke="currentColor" stroke-width="4" stroke-linecap="round"/></svg>
+    <strong>Nobody shortlisted on {{ selected_date_label }}</strong><p>Choose another date or add profiles from Discover.</p><a class="button button-primary" href="{{ url_for('search_page') }}">Find creators</a>
+  </div>
 {% endif %}
 {% endif %}
 {% endblock %}

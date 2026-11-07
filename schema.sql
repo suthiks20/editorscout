@@ -93,6 +93,15 @@ CREATE TABLE IF NOT EXISTS search_cache (
     PRIMARY KEY (query, page, per_page)
 );
 
+CREATE TABLE IF NOT EXISTS search_pool (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    search_key TEXT NOT NULL,
+    url TEXT NOT NULL,
+    profile_json TEXT NOT NULL,
+    found_at TEXT NOT NULL,
+    UNIQUE (search_key, url)
+);
+
 CREATE TABLE IF NOT EXISTS searches (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     query TEXT NOT NULL,
@@ -105,3 +114,4 @@ CREATE INDEX IF NOT EXISTS idx_people_status ON people(status);
 CREATE INDEX IF NOT EXISTS idx_people_sent_at ON people(sent_at);
 CREATE INDEX IF NOT EXISTS idx_messages_person_id ON messages(person_id);
 CREATE INDEX IF NOT EXISTS idx_sent_messages_person_id ON sent_messages(person_id);
+CREATE INDEX IF NOT EXISTS idx_search_pool_key ON search_pool(search_key);

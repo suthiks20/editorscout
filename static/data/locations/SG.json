@@ -1,0 +1,42 @@
+{
+  "states": [
+    {
+      "name": "Central Region",
+      "cities": [
+        "Singapore"
+      ]
+    },
+    {
+      "name": "East Region",
+      "cities": [
+        "Bedok",
+        "Tampines",
+        "Pasir Ris"
+      ]
+    },
+    {
+      "name": "North Region",
+      "cities": [
+        "Woodlands",
+        "Yishun",
+        "Sembawang"
+      ]
+    },
+    {
+      "name": "North-East Region",
+      "cities": [
+        "Hougang",
+        "Sengkang",
+        "Punggol"
+      ]
+    },
+    {
+      "name": "West Region",
+      "cities": [
+        "Jurong East",
+        "Jurong West",
+        "Clementi"
+      ]
+    }
+  ]
+}

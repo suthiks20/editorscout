@@ -1,6 +1,6 @@
 import sqlite3
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from profile_urls import normalize_linkedin_url
@@ -63,6 +63,12 @@ def init_db(database_path, schema_path=None):
     schema_file = Path(schema_path) if schema_path else Path(__file__).with_name("schema.sql")
     with connect(database_path) as connection:
         connection.executescript(schema_file.read_text(encoding="utf-8"))
+        pool_cutoff = (
+            datetime.now(timezone.utc) - timedelta(days=7)
+        ).isoformat(timespec="seconds")
+        connection.execute(
+            "DELETE FROM search_pool WHERE found_at < ?", (pool_cutoff,)
+        )
         columns = {
             row["name"] for row in connection.execute("PRAGMA table_info(people)")
         }

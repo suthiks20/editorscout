@@ -1,5 +1,5 @@
 {% extends "base.html" %}
-{% block title %}Discover creators · EditorScout{% endblock %}
+{% block title %}Discover · EditorScout{% endblock %}
 {% macro hidden_search_filters(filters) %}
   {% for key, value in filters.items() %}
     {% if key == 'platforms' %}
@@ -8,16 +8,56 @@
       <input type="hidden" name="{{ key }}" value="{{ value }}">
     {% endif %}
   {% endfor %}
+  {% if search_key is defined %}<input type="hidden" name="search_key" value="{{ search_key }}">{% endif %}
   {% if filters.get('mode') == 'person' %}<input type="hidden" name="platforms_enabled" value="1">{% endif %}
+{% endmacro %}
+{% macro browse_pagination(position) %}
+  <div class="pagination pagination-{{ position }}">
+    {% if previous_cursors %}
+      <form method="post" action="{{ url_for('search') }}">
+        {{ hidden_search_filters(filters) }}
+        <input type="hidden" name="raw_page_cursor" value="{{ previous_cursors[-1] }}">
+        <input type="hidden" name="prev_cursors" value="{{ previous_cursors[:-1]|join(',') }}">
+        <input type="hidden" name="show_saved" value="{{ '1' if show_saved else '0' }}">
+        <button class="button button-secondary" type="submit">← Previous</button>
+      </form>
+    {% endif %}
+    <span>Page {{ page }}</span>
+    {% if next_page %}
+      <form method="post" action="{{ url_for('search') }}">
+        {{ hidden_search_filters(filters) }}
+        <input type="hidden" name="raw_page_cursor" value="{{ next_raw_page_cursor }}">
+        <input type="hidden" name="prev_cursors" value="{{ next_previous_cursors|join(',') }}">
+        <input type="hidden" name="show_saved" value="{{ '1' if show_saved else '0' }}">
+        <button class="button button-secondary" type="submit">Next →</button>
+      </form>
+    {% endif %}
+    {% if position == 'top' %}
+      <form method="post" action="{{ url_for('search') }}" class="pool-collect-form" data-confirm="This can use up to 5 Serper credits. Continue?">
+        {{ hidden_search_filters(filters) }}
+        <input type="hidden" name="collect" value="1">
+        <input type="hidden" name="raw_page_cursor" value="{{ raw_page_cursor }}">
+        <input type="hidden" name="prev_cursors" value="{{ previous_cursors|join(',') }}">
+        <input type="hidden" name="collect_cursor" value="{{ pool_collect_cursor }}">
+        <input type="hidden" name="show_saved" value="{{ '1' if show_saved else '0' }}">
+        <button class="button button-secondary" type="submit" {% if not pool_has_more or pool_count >= 50 %}disabled{% endif %}>Collect up to 50 profiles</button>
+      </form>
+    {% endif %}
+  </div>
 {% endmacro %}
 {% block content %}
 <section class="page-heading">
   <p class="eyebrow">DISCOVER</p>
-  <h1>Find your next creative collaborator.</h1>
-  <p>Search public web results for Coimbatore-based video talent. Review profiles yourself before reaching out.</p>
+  <h1>Find your next creative <span class="ui-grad">collaborator.</span></h1>
+  <p>Search public web results for video talent anywhere in the world. Review profiles yourself before reaching out.</p>
 </section>
+<ol class="ui-steps" aria-label="How EditorScout works">
+  <li><span>1</span><strong>Search</strong><small>Find public profiles</small></li>
+  <li><span>2</span><strong>Shortlist</strong><small>Review your matches</small></li>
+  <li><span>3</span><strong>Message</strong><small>Reach out manually</small></li>
+</ol>
 
-<form class="panel search-form" action="{{ url_for('search') }}" method="post">
+<form class="panel search-form ui-search-card" action="{{ url_for('search') }}" method="post">
   <fieldset class="mode-toggle">
     <legend>Search mode</legend>
     <label><input type="radio" name="mode" value="browse" {% if filters.get('mode', 'browse') == 'browse' %}checked{% endif %}> Browse by role</label>
@@ -36,18 +76,56 @@
     {% endfor %}
     <p class="form-footnote"><strong id="platform-credit-estimate">{{ selected_platforms|length }} searches will use {{ selected_platforms|length }} Serper credits</strong>. A YouTube fallback may use one extra credit if video results are empty.</p>
   </fieldset>
-  <div class="form-grid">
+  <section class="ui-form-section ui-role-section">
+    <p class="eyebrow">01 / ROLE</p>
+    <h2>Role</h2>
     <label id="role-field">Role keyword
-      <select name="role" id="role-input" required>
+      <select name="role" id="role-input">
         <option value="" {% if not filters.get('role', roles[0]) %}selected{% endif %}>Any role</option>
         {% for role in roles %}
           <option value="{{ role }}" {% if filters.get('role', roles[0]) == role %}selected{% endif %}>{{ role|title }}</option>
         {% endfor %}
       </select>
     </label>
-    <label>City
-      <input name="city" id="city-input" value="{{ filters.get('city', 'Coimbatore') }}" maxlength="100">
+  </section>
+  <section class="ui-form-section ui-location-section">
+  <p class="eyebrow">02 / LOCATION</p>
+  <h2>Location <span class="label-hint">Optional · leave blank for worldwide results</span></h2>
+  <fieldset class="loc-controls" id="location-controls"
+      data-initial-state="{{ filters.get('state', '') }}"
+      data-initial-city="{{ filters.get('city', '') }}"
+      data-initial-state-custom="{{ filters.get('state_custom', '') }}"
+      data-initial-city-custom="{{ filters.get('city_custom', '') }}">
+    <legend class="visually-hidden">Location</legend>
+    <label for="loc-country">Country
+      <select name="country" id="loc-country">
+        <option value="">Anywhere (worldwide)</option>
+        {% for country in countries %}
+          <option value="{{ country.code }}" {% if filters.get('country', 'IN') == country.code %}selected{% endif %}>{{ country.name }}</option>
+        {% endfor %}
+      </select>
     </label>
+    <label for="loc-state">State / Region
+      <select name="state" id="loc-state" disabled>
+        {% if filters.get('state') %}<option value="{{ filters.get('state') }}" selected>{{ filters.get('state') }}</option>{% else %}<option value="" selected>Any state / region</option>{% endif %}
+      </select>
+      <input name="state_custom" id="loc-state-custom" aria-label="Custom state or region" maxlength="80" placeholder="Type a state or region" value="{{ filters.get('state_custom', '') }}" hidden disabled>
+      <span class="label-hint" id="loc-state-help">Choose a country first.</span>
+    </label>
+    <label for="loc-city">City
+      <select name="city" id="loc-city" disabled>
+        {% if filters.get('city') %}<option value="{{ filters.get('city') }}" selected>{{ filters.get('city') }}</option>{% else %}<option value="" selected>Any city</option>{% endif %}
+      </select>
+      <input name="city_custom" id="loc-city-custom" aria-label="Custom city" maxlength="80" placeholder="Type a city" value="{{ filters.get('city_custom', '') }}" hidden disabled>
+      <span class="label-hint" id="loc-city-help">Choose a state or region first.</span>
+      <span class="label-hint loc-no-data" id="loc-no-data" hidden>No city list for this country yet. Type the city or region yourself.</span>
+    </label>
+  </fieldset>
+  </section>
+  <section class="ui-form-section ui-filters-section">
+    <p class="eyebrow">03 / FILTERS</p>
+    <h2>Filters</h2>
+    <div class="form-grid">
     <label>Organisation type
       <select name="org_type" id="org-type">
         <option value="" {% if not filters.get('org_type') %}selected{% endif %}>Any</option>
@@ -81,37 +159,83 @@
         <option value="10" {% if filters.get('per_page', per_page) == 10 or filters.get('per_page') == '10' %}selected{% endif %}>10 results</option>
       </select>
     </label>
-  </div>
+    <label class="checkbox-label widen-search-option" id="widen-search-field" {% if filters.get('mode', 'browse') == 'person' %}hidden{% endif %}>
+      <input type="checkbox" name="widen_search" value="1" {% if filters.get('widen_search') %}checked{% endif %} {% if filters.get('mode', 'browse') == 'person' %}disabled{% endif %}>
+      Widen search (also try related terms)
+    </label>
+    </div>
+  </section>
+  <section class="ui-form-section ui-options-section">
+    <p class="eyebrow">04 / OPTIONS</p>
+    <h2>Options</h2>
+    <label class="checkbox-label loc-disambiguate">
+      <input type="checkbox" name="disambiguate" value="1" {% if filters.get('disambiguate') %}checked{% endif %}>
+      Disambiguate common city names by adding the selected state to the query
+    </label>
+  </section>
   <input type="hidden" name="page" value="1">
-  <button class="button button-primary" type="submit">Search public web results</button>
+  <div class="ui-search-submit">
+    <button class="button button-primary ui-button-large" type="submit">Search public web results</button>
+  <span class="form-footnote search-credit-estimate" id="search-credit-estimate" {% if filters.get('mode', 'browse') == 'person' %}hidden{% endif %}>Up to 3 credits per search</span>
+  </div>
   <p class="form-footnote">Search results can't confirm identity or dates; verify dates on the profile. Check the photo, name and organisation on the profile before shortlisting. The app uses Serper result metadata only and never fetches platform pages.</p>
 </form>
 
 {% if results is not none %}
   <section class="results-section">
-    <div class="section-heading">
+  {% if platform_groups is not defined %}
+    {% set selectable = namespace(count=0) %}
+    {% for result in results %}
+      {% if not result.shortlist_disabled %}{% set selectable.count = selectable.count + 1 %}{% endif %}
+    {% endfor %}
+    {% set selectable_count = selectable.count %}
+  {% endif %}
+  <div class="section-heading">
       <div>
         <p class="eyebrow">RESULTS</p>
         <h2>Search results</h2>
         <p class="muted">Query: <code>{{ search_query }}</code>{% if cached %} · Cached result{% endif %}</p>
+        <p class="muted loc-results-label">Location: {{ location_label|default('Worldwide') }}</p>
+        {% if filters.get('mode') == 'browse' %}
+          <div class="search-diagnostic">
+            <span>Serper returned {{ raw_result_count }} results · {{ non_profile_count }} were not profile links · {{ already_saved_count }} already in your shortlist · showing {{ results|length }}. Used {{ used_credits }} credits.</span>
+            <form method="post" action="{{ url_for('search') }}">
+              {{ hidden_search_filters(filters) }}
+              <input type="hidden" name="raw_page_cursor" value="{{ raw_page_cursor }}">
+              <input type="hidden" name="prev_cursors" value="{{ previous_cursors|join(',') }}">
+              <input type="hidden" name="show_saved" value="{{ '1' if show_saved else '0' }}">
+              <input type="hidden" name="show_saved" value="{% if not show_saved %}1{% else %}0{% endif %}">
+              <button class="button button-secondary" type="submit">{% if show_saved %}Hide already-saved people{% else %}Show already-saved people{% endif %}</button>
+            </form>
+          </div>
+          {% if underfilled %}
+            <p class="muted small underfilled-note">Only {{ results|length }} usable profiles found for this search. Try a wider role or remove the city filter, or press Next.</p>
+          {% endif %}
+          {% if collection_message %}<p class="pool-collection-result" aria-live="polite">{{ collection_message }}</p>{% endif %}
+          {{ browse_pagination('top') }}
+        {% endif %}
       </div>
-      <span class="result-count">{% if platform_groups is defined %}{{ platform_groups|map(attribute='results')|map('length')|sum }}{% else %}{{ results|length }}{% endif %} profiles</span>
+      <div class="sel-summary">
+        {% if platform_groups is not defined %}
+          <div class="pool-summary" aria-live="polite" data-page-count="{{ pool_page_count }}" data-saved-count="{{ pool_saved_count }}">
+            {{ pool_total }} discovered across {{ pool_page_count }} pages ({{ pool_saved_count }} already in your shortlist, skipped)
+            {% if pool_count %}                  <form method="post" action="{{ url_for('clear_search_pool') }}" class="pool-clear-form">
+              {{ hidden_search_filters(filters) }}
+              <input type="hidden" name="raw_page_cursor" value="{{ raw_page_cursor }}">
+              <input type="hidden" name="prev_cursors" value="{{ previous_cursors|join(',') }}">
+              <input type="hidden" name="skip_pool_upsert" value="1">
+              <button class="pool-clear-link" type="submit">Clear discovered list</button>
+            </form>{% endif %}
+          </div>
+        {% endif %}
+        <span class="result-count">{% if platform_groups is defined %}{{ platform_groups|map(attribute='results')|map('length')|sum}}{% else %}{{ results|length }}{% endif %} profiles</span>
+      </div>
     </div>
-    {% if filters.get('mode') == 'browse' and already_saved_count %}
-      <div class="saved-toggle">
-        <span>{{ already_saved_count }} already saved {% if show_saved %}shown{% else %}hidden{% endif %}</span>
-        <form method="post" action="{{ url_for('search') }}">
-          {{ hidden_search_filters(filters) }}
-          <input type="hidden" name="page" value="{{ page }}">
-          <input type="hidden" name="show_saved" value="{% if not show_saved %}1{% endif %}">
-          <button class="button button-secondary" type="submit">{% if show_saved %}Hide saved{% else %}Show them{% endif %}</button>
-        </form>
-      </div>
-    {% endif %}
     {% if platform_groups is defined %}
       <form method="post" action="{{ url_for('shortlist') }}">
         {% for group in platform_groups %}
           <section class="platform-results">
+            <p class="eyebrow">PUBLIC WEB</p>
             <h3>{{ group.platform|title }}{% if group.cached %} <span class="hint-badge">Cached</span>{% endif %}</h3>
             <p class="muted small">Query: <code>{{ group.query }}</code></p>
             {% if group.error %}
@@ -139,7 +263,10 @@
                 {% endfor %}
               </div>
             {% else %}
-              <p class="muted">No matching links found for this platform.</p>
+              <div class="empty-state ui-empty-state">
+                <svg aria-hidden="true" viewBox="0 0 96 72" fill="none"><circle cx="42" cy="33" r="20" stroke="currentColor" stroke-width="4"/><path d="m57 48 17 16M28 34h28M35 42h14" stroke="currentColor" stroke-width="4" stroke-linecap="round"/></svg>
+                <strong>No matching links found for this platform.</strong><p>Try a broader search or review another platform.</p><a class="button button-secondary" href="{{ url_for('search_page') }}">Adjust your search</a>
+              </div>
             {% endif %}
           </section>
         {% endfor %}
@@ -147,19 +274,27 @@
           <div class="table-actions"><button class="button button-primary" type="submit">Shortlist selected LinkedIn profiles</button></div>
         {% endif %}
       </form>
-    {% elif results %}
-      <form method="post" action="{{ url_for('shortlist') }}">
+    {% elif results or filters.get('mode') == 'browse' %}
+      <form method="post" action="{{ url_for('shortlist') }}" id="shortlist-results-form" data-confirm="" data-selectable-count="{{ selectable_count }}" data-pool-url="{{ url_for('shortlist_pool') }}">
+        <input type="hidden" name="search_key" value="{{ search_key }}">
+        <input type="hidden" name="confirm_all" value="0">
         <div class="table-wrap">
-          <table class="results-table">
-            <thead><tr><th>Shortlist</th><th>Creator</th><th>Organisation</th></tr></thead>
+          <table class="results-table" id="shortlist-results-table">
+            <thead><tr><th>Shortlist <label class="select-page-label"><input type="checkbox" data-select-page-results aria-label="Select all on this page"></label></th><th>Creator</th><th>Organisation</th></tr></thead>
             <tbody>
               {% for result in results %}
                 <tr>
                   <td><input class="profile-check" type="checkbox" name="profile" value="{{ result|tojson|forceescape }}" aria-label="Shortlist {{ result.name }}" {% if result.shortlist_disabled %}disabled{% endif %}></td>
                   <td>
-                    <a class="profile-name" href="{{ result.url }}" target="_blank" rel="noopener noreferrer">{{ result.name }}</a>
-                    {% if result.headline %}<div class="profile-headline">{{ result.headline }}</div>{% endif %}
-                    {% if result.snippet %}<p class="profile-snippet">{{ result.snippet }}</p>{% endif %}
+                            <div class="ui-creator-heading">
+                            <span class="ui-avatar" aria-hidden="true">{{ (result.name or '?')[:1]|upper }}</span>
+                            <div class="ui-creator-copy">
+                            <a class="profile-name" href="{{ result.url }}" target="_blank" rel="noopener noreferrer">{{ result.name }}</a>
+                            {% if result.role_label %}<div class="hint-badge role-result-badge">{{ result.role_label }}</div>{% endif %}
+                            </div>
+                            </div>
+                            {% if result.headline %}<div class="profile-headline">{{ result.headline }}</div>{% endif %}
+                            {% if result.snippet %}<p class="profile-snippet ui-snippet-preview">{{ result.snippet }}</p><details class="ui-snippet-more"><summary>Show more</summary><p>{{ result.snippet }}</p></details>{% endif %}
                     {% if result.saved_person %}<span class="hint-badge">Already in tracker: {{ result.saved_person.batch_name }}, status {{ result.saved_person.status }}</span>{% endif %}
                     <div class="result-badges">
                       {% if result.org_name %}<span class="hint-badge {% if result.org_match %}hint-match{% else %}hint-mismatch{% endif %}">{% if result.org_match %}Org match{% else %}Org not in snippet{% endif %}</span>{% else %}<span class="hint-badge">No org filter</span>{% endif %}
@@ -174,27 +309,30 @@
                   <td>{% if result.org_name %}<span class="tag">{{ result.org_name }}</span><div class="muted small">{{ result.org_type|title }}</div>{% else %}<span class="muted">—</span>{% endif %}</td>
                 </tr>
               {% endfor %}
+              {% if not results %}<tr><td colspan="3"><div class="empty-state ui-empty-state">
+                <svg aria-hidden="true" viewBox="0 0 96 72" fill="none"><circle cx="42" cy="33" r="20" stroke="currentColor" stroke-width="4"/><path d="m57 48 17 16M28 34h28M35 42h14" stroke="currentColor" stroke-width="4" stroke-linecap="round"/><path d="M75 10h10M80 5v10" stroke="currentColor" stroke-width="3" stroke-linecap="round"/></svg>
+                <strong>No new profiles on this page.</strong><p>No results to show after saved-profile filtering. Try another page or adjust your filters.</p><a class="button button-secondary" href="{{ url_for('search_page') }}">Adjust your search</a>
+              </div></td></tr>{% endif %}
             </tbody>
           </table>
         </div>
-        <div class="table-actions">
-          <button class="button button-primary" type="submit">Add selected to shortlist</button>
-          <span class="muted">Profiles must be reviewed manually; nothing is sent by the app.</span>
+        <div class="table-actions ui-selection-bar">
+          <fieldset class="pool-scope" data-pool-count="{{ pool_count }}" data-pool-url="{{ url_for('shortlist_pool') }}">
+            <legend>Shortlist scope</legend>
+            <label><input type="radio" name="selection_scope" value="page" checked> This page ({{ selectable_count }})</label>
+            <label><input type="radio" name="selection_scope" value="pool" {% if pool_count == 0 %}disabled{% endif %}> All discovered so far ({{ pool_count }})</label>
+          </fieldset>
+          <span class="sel-selected-count" data-selected-count aria-live="polite">0 of {{ selectable_count }} selected</span>
+          <button class="button button-primary" type="submit" data-selection-submit disabled>Add selected to shortlist</button>
+          <p class="form-footnote sel-note">Shortlisting only saves the profile. Review each one before contact.</p>
         </div>
       </form>
     {% else %}
       <div class="empty-state"><strong>No new profiles on this page.</strong><p>No results to show after saved-profile filtering. Try another page or adjust your filters.</p></div>
     {% endif %}
-    <div class="search-result-actions">
-      <form method="post" action="{{ url_for('search') }}">
-        {{ hidden_search_filters(filters) }}
-        <input type="hidden" name="page" value="{{ page }}">
-        <input type="hidden" name="refresh" value="1">
-        {% if show_saved %}<input type="hidden" name="show_saved" value="1">{% endif %}
-        <button class="button button-secondary" type="submit">Refresh</button>
-      </form>
-    </div>
-    {% if page > 1 or next_page %}
+    {% if filters.get('mode') == 'browse' %}
+      {{ browse_pagination('bottom') }}
+    {% elif page > 1 or next_page %}
       <div class="pagination">
         {% if page > 1 %}
           <form method="post" action="{{ url_for('search') }}">
@@ -215,6 +353,20 @@
         {% endif %}
       </div>
     {% endif %}
+    <div class="search-result-actions">
+      <form method="post" action="{{ url_for('search') }}">
+        {{ hidden_search_filters(filters) }}
+        {% if filters.get('mode') == 'browse' %}
+          <input type="hidden" name="raw_page_cursor" value="{{ raw_page_cursor }}">
+          <input type="hidden" name="prev_cursors" value="{{ previous_cursors|join(',') }}">
+        {% else %}
+          <input type="hidden" name="page" value="{{ page }}">
+        {% endif %}
+        <input type="hidden" name="refresh" value="1">
+        {% if show_saved %}<input type="hidden" name="show_saved" value="1">{% endif %}
+        <button class="button button-secondary" type="submit">Refresh</button>
+      </form>
+    </div>
   </section>
 {% endif %}
 {% endblock %}

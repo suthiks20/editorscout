@@ -1,0 +1,137 @@
+{
+  "states": [
+    {
+      "name": "Central Province",
+      "cities": [
+        "Kandy",
+        "Dambulla",
+        "Matale",
+        "Nuwara Eliya",
+        "Gampola",
+        "Hatton",
+        "Talawakele",
+        "Kadugannawa",
+        "Sigiriya"
+      ]
+    },
+    {
+      "name": "Eastern Province",
+      "cities": [
+        "Trincomalee",
+        "Kalmunai",
+        "Batticaloa",
+        "Pottuvil",
+        "Ampara",
+        "Eravur Town",
+        "Vakarai"
+      ]
+    },
+    {
+      "name": "North Central Province",
+      "cities": [
+        "Anuradhapura",
+        "Polonnaruwa",
+        "Mihintale"
+      ]
+    },
+    {
+      "name": "North Western Province",
+      "cities": [
+        "Puttalam",
+        "Kurunegala",
+        "Chilaw",
+        "Kuliyapitiya"
+      ]
+    },
+    {
+      "name": "Northern Province",
+      "cities": [
+        "Jaffna",
+        "Point Pedro",
+        "Valvedditturai",
+        "Vavuniya",
+        "Mannar",
+        "Mullaittivu",
+        "Kilinochchi",
+        "Keppapularu"
+      ]
+    },
+    {
+      "name": "Sabaragamuwa Province",
+      "cities": [
+        "Ratnapura",
+        "Kegalle"
+      ]
+    },
+    {
+      "name": "Southern Province",
+      "cities": [
+        "Galle",
+        "Ambalantota",
+        "Matara",
+        "Beliatta",
+        "Ambalangoda",
+        "Devinuwara",
+        "Bentota",
+        "Weligama",
+        "Hambantota",
+        "Tangalle",
+        "Mirissa city",
+        "Koggala",
+        "Talpe",
+        "Wanduruppa",
+        "Unawatuna",
+        "Ekkassa",
+        "Hikkaduwa",
+        "Urawatawangoda"
+      ]
+    },
+    {
+      "name": "Uva Province",
+      "cities": [
+        "Badulla",
+        "Kataragama",
+        "Monaragala",
+        "Wellawaya",
+        "Wattegama",
+        "Ella Town",
+        "Haputale",
+        "Bogahakumbura"
+      ]
+    },
+    {
+      "name": "Western Province",
+      "cities": [
+        "Colombo",
+        "Dehiwala-Mount Lavinia",
+        "Maharagama",
+        "Moratuwa",
+        "Negombo",
+        "Pita Kotte",
+        "Sri Jayewardenepura Kotte",
+        "Katunayaka",
+        "Battaramulla South",
+        "Kolonnawa",
+        "Kotikawatta",
+        "Hendala",
+        "Welisara",
+        "Kalutara",
+        "Homagama",
+        "Beruwala",
+        "Panadura",
+        "Mulleriyawa",
+        "Kandana",
+        "Ja Ela",
+        "Wattala",
+        "Kelaniya",
+        "Peliyagoda",
+        "Hanwella Ihala",
+        "Gampaha",
+        "Horana South",
+        "Minuwangoda",
+        "Horawala Junction",
+        "Mawalgama"
+      ]
+    }
+  ]
+}

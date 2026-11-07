@@ -3,7 +3,7 @@
 {% block content %}
 <section class="page-heading">
   <p class="eyebrow">MANUAL DRAFT</p>
-  <h1>{% if channel == 'connection' %}Connection note{% else %}Follow-up pitch{% endif %}</h1>
+  <h1>{% if channel == 'connection' %}Connection <span class="ui-grad">note</span>{% else %}Follow-up <span class="ui-grad">pitch</span>{% endif %}</h1>
   <p>For <a href="{{ person.url }}" target="_blank" rel="noopener noreferrer">{{ person.name }}</a>. Review and edit this message before copying it.</p>
 </section>
 {% if repeat_warning %}

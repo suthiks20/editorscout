@@ -2,7 +2,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from config import Config
-from search_provider import SearchAPIError, SearchResponseError, search_videos
+from search_provider import SearchAPIError, SearchResponseError, search_videos, search_web
 
 
 class SearchProviderVideoTests(unittest.TestCase):
@@ -46,6 +46,19 @@ class SearchProviderVideoTests(unittest.TestCase):
         response.json.return_value = {"organic": []}
         with self.assertRaises(SearchResponseError):
             search_videos("video editor")
+
+    @patch("search_provider.requests.post")
+    @patch.object(Config, "SERPER_API_KEY", "unit-test-key")
+    def test_search_web_uses_optional_country_code(self, mock_post):
+        response = Mock()
+        response.ok = True
+        response.json.return_value = {"organic": []}
+        mock_post.return_value = response
+
+        search_web("video editor", gl="US")
+        self.assertEqual(mock_post.call_args.kwargs["json"]["gl"], "us")
+        search_web("video editor", gl=None)
+        self.assertNotIn("gl", mock_post.call_args.kwargs["json"])
 
 
 if __name__ == "__main__":
